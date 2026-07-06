@@ -81,7 +81,28 @@ All plugin modules derive from these virtual base classes:
 - `NavStateFilter` — navigation state estimators
 - `LocalizationSourceBase` — localization systems
 - `MapSourceBase` / `MapServer` — map sources/servers
-- `VizInterface` — visualization (backend-agnostic, updated in v2.6)
+- `VizInterface` — visualization (backend-agnostic, updated in v2.6). The
+  `mola_viz_imgui` backend auto-exposes a dockable "Console" subwindow that
+  aggregates mrpt-logger output from all running modules (gated by the
+  `console_enabled` param, added subsequently). On a fresh profile (no saved
+  `imgui_*.ini` layout yet) the Console is auto-docked at the bottom of the
+  main window instead of floating; an existing saved layout is left as-is.
+  The same fresh-profile layout also reserves a strip at the top of the main
+  window (`PerWindowData::default_dock_top_id`) for windows whose title is
+  only known at runtime; any `GuiWidgetDescription::WindowDescription` with
+  `dock_top_by_default = true` (e.g. the per-module `Dataset_UI` playback
+  panel) is docked there the first time it is created. No-op once a saved
+  layout exists, and on the nanogui `MolaViz` backend.
+  Also exposes `register_metric()`/`push_metric()` (feature macro
+  `MOLA_KERNEL_VIZ_HAS_METRICS`) so any module can stream timestamped scalar
+  values ("metrics") to live, autoscrolling plot windows opened from the
+  built-in "View" menu (gated by the `plots_enabled` param); rendered via
+  ImPlot on the `mola_viz_imgui` backend only, no-op on the nanogui `MolaViz`
+  backend. The top main menu bar itself (host mode only; hosts the "MOLA"
+  menu (with "Quit", which requests full application shutdown), the "View"
+  menu, plus any module-installed `set_menu_bar()` menus) can be turned off
+  entirely via `menu_bar_enabled` (default `true`); existing plot/console
+  windows keep working when it is disabled.
 - `Relocalization` — global localization / loop closure
 - `OfflineDatasetSource` — offline dataset handling
 - `KeyframeMapCapable` — mixin for keyframe-based metric maps needing per-KF
@@ -129,6 +150,67 @@ Tests: `mola_yaml/tests/test-yaml-parser.cpp`
   `.ini` file, using `OptionsCapable` generically for classes in this library, plus a
   `dynamic_cast`-based fallback in `include/mola_metric_maps/OptionsIniIO.h` for basic
   `mrpt::maps` classes (`CPointsMap`-derived, `COccupancyGridMap2D`).
+- CLI tool `mm-kf-regroup` (in `apps/`): offline optimization of a `KeyframePointCloudMap`
+  layer for fast **localization-only** operation. It groups many small keyframes into a few
+  larger, deliberately-overlapping "super-keyframes" so the ICP active set stays size 1 (no
+  per-scan keyframe switching). Backed by `KeyframePointCloudMap::regroupKeyframes()`
+  (see `RegroupParams`): builds a keyframe adjacency graph with voxel Jaccard-min overlap
+  edge weights, then greedy overlapping set-cover clustering auto-sized from each keyframe's
+  bounding box (large outdoors, small indoors). Merged clouds are voxel-decimated
+  (`--decimate-voxel`, view-direction fields carried) to bound the overlap-induced point
+  blow-up. On a 1000-KF outdoor map this yields ~5 super-KFs. This is "idea 1" of the
+  keyframe-map persistence plan. Building each super-KF cloud (the merge +
+  voxel-decimate step) is the most expensive part of `regroupKeyframes()` and is
+  parallelized across clusters with TBB (`tbb::parallel_for`, gated by
+  `MOLA_METRIC_MAPS_USE_TBB`, falling back to a serial loop when TBB is absent).
+- `KeyframePointCloudMap::TCreationOptions::approximate_cov` (default `false`): for
+  `nn_search_cov2cov()` (used by `mp2p_icp::Matcher_Cov2Cov`, i.e. GICP-style pipelines).
+  When `true`, `icp_get_prepared_as_global()` skips assembling the merged, multi-keyframe
+  submap for the active KF set and instead only warms each active KF's own (already cached)
+  KD-tree and per-point covariances; `nn_search_cov2cov()` then does one KD-tree query per
+  active KF ("N" queries instead of 1 on a merged cloud) and keeps the closest, using that
+  KF's own cached covariance. Trades exactness (covariances are estimated only from
+  within-KF neighbors, not the merged multi-KF cloud) for speed (no merge/KD-tree rebuild).
+  Only affects `nn_search_cov2cov()`; the generic `NearestNeighborsCapable` entry points
+  still require the merged submap. Exposed in `mola_lidar_odometry`'s
+  `pipelines/lidar3d-gicp.yaml` as `MOLA_LOCALMAP_APPROXIMATE_COV`.
+  **Queries the per-KF *local*-frame cloud/KD-tree directly** (`kf.pointcloud()`, which is
+  what `mm-kf-bake-kdtrees` bakes on disk): the query point is transformed into each active
+  KF's local frame (`pose^{-1}`) before the lookup, and the match is composed back to global
+  for the output pairing. A KD-tree's structure is invariant under the rigid KF pose, so this
+  avoids ever materializing a per-KF *global*-frame cloud or rebuilding a KD-tree on it — the
+  reason the baked (local) index previously did not accelerate this path, and why a fresh KF
+  entering the active set used to stall the LiDAR worker for seconds. Also robust to online KF
+  pose nudges (e.g. LIO gravity-tilt correction), which no longer invalidate a global cloud.
+- CLI tool `mm-kf-bake-kdtrees` (in `apps/`): "idea 2" of the same plan. Caches heavy
+  per-keyframe structures inside the `.mm` so they are not rebuilt on every load (faster
+  localization-only startup). Two independent, self-describing caches (each gated by a flag
+  byte, so `.mm` files stay interoperable across MRPT builds):
+  - **KD-trees** (`serialize_kdtrees` creationOption, default false): each keyframe's
+    per-cloud 3D KD-tree index (on the *local*-frame cloud). Requires the MRPT KD-tree
+    save/load index API (`mrpt::math::KDTreeCapable::kdtree_save_index_3D()` /
+    `kdtree_load_index_3D()`, feature-detected via the `MRPT_HAS_KDTREE_SAVE_LOAD_INDEX`
+    macro); when absent the option is a no-op on write and the reader skips any stored blob.
+    On the 5-super-KF outdoor map above (9.4M points), baking adds ~58 MB. This is the same
+    local index the `approximate_cov` path now queries directly (see above), so baking finally
+    accelerates the localization hot path, not just startup.
+  - **Covariances** (`serialize_covariances` creationOption, default false): each keyframe's
+    per-point *local*-frame covariances (the plane-regularized SVD result). Needs **no special
+    MRPT API** (works on any build). Covariance computation (one K-NN + 3×3 SVD per point) is
+    the single most expensive part of warming a keyframe, so persisting it removes the
+    multi-second stall paid the first time each KF becomes active. The cheap per-pose global
+    rotation is still done at runtime.
+
+  Bumps map serialization to v3 (v2 = KD-tree byte/blob after each KF cloud; v3 adds a
+  covariance byte + per-point matrices after that). The tool bakes both by default; use
+  `--no-kdtrees` / `--no-covariances` to select, or `--disable` to strip both.
+
+  The tool also sets `approximate_cov=YES` on the output map by default (`--no-approximate-cov`
+  to opt out; forced off by `--disable`). This matters: the baked data is only consumed by the
+  approximate cov2cov path, so without it the loaded map ignores the cache and rebuilds a merged
+  submap from scratch on every KF-set change (the multi-second stall this whole feature exists to
+  avoid). Note the runtime `MOLA_LOCALMAP_APPROXIMATE_COV` env var only configures the live local
+  map, not a loaded `.mm`, whose `approximate_cov` is read from the file.
 
 ---
 
@@ -203,6 +285,33 @@ Do not use direct MRPT GUI calls in modules — use the `VizInterface` abstracti
 - Example configs: `mola_demos/mola-cli-launchs/`
 - Per-package docs: each directory has a `README.md`
 - Main docs source: `docs/` (Sphinx + Doxygen)
+
+---
+
+## Environment Variables (Debug/Tracing Flags)
+
+All debug/tracing flags use `mrpt::get_env<T>(name, default)` (from
+`<mrpt/core/get_env.h>`), never plain `::getenv`/`std::getenv`. The one
+exception is `mola_yaml`'s `${VAR}` expansion (`yaml_helpers.cpp`), which
+needs tri-state unset-vs-empty semantics that `mrpt::get_env` cannot express,
+so it keeps `::getenv` by design.
+
+| Variable | Type | Default | Location | Purpose |
+|----------|------|---------|----------|---------|
+| `MOLA_MODULES_LIB_PATH` | path list | (unset) | `mola_launcher/src/MolaLauncherApp.cpp` | Extra directories to search for module shared libraries |
+| `MOLA_MODULES_SHARED_PATH` | path list | (unset) | `mola_launcher/src/MolaLauncherApp.cpp` | Extra directories to search for module shared (data) files |
+| `MOLA_KEYFRAME_MAP_PROFILE_COV` | bool | false | `mola_metric_maps/src/KeyframePointCloudMap.cpp` | Print profiling stats for per-KF covariance computation |
+| `MOLA_KEYFRAME_MAP_DEBUG_ACTIVE_KFS` | bool | false | `mola_metric_maps/src/KeyframePointCloudMap.cpp` | Trace which keyframes are in the active ICP set |
+| `MOLA_KEYFRAME_MAP_DEBUG_DUMP_KFS_ON_LOAD` | bool | false | `mola_metric_maps/src/KeyframePointCloudMap.cpp` | Dump per-keyframe debug info right after loading a `.mm` map |
+| `MOLA_KEYFRAME_MAP_DEBUG_MATCH_STATS` | bool | false | `mola_metric_maps/src/KeyframePointCloudMap.cpp` | Trace nearest-keyframe selection / point-density match statistics |
+| `MOLA_KEYFRAME_MAP_VIZ_SHOW_ACTIVE_SUBMAP` | bool | false | `mola_metric_maps/src/KeyframePointCloudMap.cpp` | Render the merged active-KF submap used for ICP |
+| `MOLA_KEYFRAME_MAP_VIZ_OVERRIDE_AXES_LENGTH` | float | 0 | `mola_metric_maps/src/KeyframePointCloudMap.cpp` | Override the length of per-KF pose axes in the 3D view |
+| `MOLA_KEYFRAME_MAP_VIZ_SHOW_COV` | bool | false | `mola_metric_maps/src/KeyframePointCloudMap.cpp` | Render per-point covariance ellipsoids |
+| `MOLA_KEYFRAME_MAP_VIZ_COLOR_BY_KF` | bool | false | `mola_metric_maps/src/KeyframePointCloudMap.cpp` | Color rendered points by owning keyframe instead of by intensity/height |
+| `MOLA_KEYFRAME_MAP_VIZ_SHOW_COV_DECIMATION` | uint32 | 0 | `mola_metric_maps/src/KeyframePointCloudMap.cpp` | Decimation factor when rendering covariance ellipsoids |
+| `MOLA_LOCALMAP_APPROXIMATE_COV` | bool | (module default) | consumed via YAML, see `KeyframePointCloudMap::TCreationOptions::approximate_cov` | Configures the live local map's approximate-cov2cov path (does not affect a loaded `.mm`, whose flag is read from the file) |
+| `TEST_GENERATE_3D_SCENES` | bool | false | `mola_metric_maps/tests/test-mola_metric_maps_ndt.cpp` | Regenerate reference 3D scene files instead of comparing against them |
+| `MOLA_YAML_VERBOSE` | bool | false | `mola_yaml/src/yaml_helpers.cpp` | Print each external YAML file loaded via `@include`/`@import` |
 
 ---
 

@@ -20,16 +20,26 @@
 #include <GLFW/glfw3.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
+#include <imgui_internal.h>
+#include <imgui_stdlib.h>
+#include <implot.h>
 #include <mola_viz_imgui/MolaVizImGuiCore.h>
 #include <mrpt/containers/yaml.h>
 #include <mrpt/core/lock_helper.h>
 #include <mrpt/opengl/COpenGLScene.h>
 #include <mrpt/opengl/CPointCloudColoured.h>
 #include <mrpt/opengl/CSetOfObjects.h>
+#include <mrpt/system/datetime.h>
+#include <mrpt/system/filesystem.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
+
+#include "MetricsRegistry.h"
 
 using namespace mola;
 
@@ -101,7 +111,10 @@ const std::string& MolaVizImGuiCore::gui_backend() const noexcept
 // Constructor / destructor
 // ---------------------------------------------------------------------------
 
-MolaVizImGuiCore::MolaVizImGuiCore() { setLoggerName("MolaVizImGuiCore"); }
+MolaVizImGuiCore::MolaVizImGuiCore() : metrics_(std::make_shared<MetricsRegistry>())
+{
+  setLoggerName("MolaVizImGuiCore");
+}
 
 MolaVizImGuiCore::~MolaVizImGuiCore()
 {
@@ -135,6 +148,10 @@ void MolaVizImGuiCore::init_for_embed(const window_name_t& name)
   wd.background_scene = mrpt::opengl::COpenGLScene::Create();
   // No background_scene_view — the embed host renders via its own CImGuiSceneView.
   embed_active_ = true;
+
+  // The embed host owns the ImGui context but not ImPlot's; create our own,
+  // once per Core instance, matching MolaVizImGui::gui_thread() in host mode.
+  if (!embed_implot_ctx_) embed_implot_ctx_ = ImPlot::CreateContext();
 }
 
 void MolaVizImGuiCore::shutdown_for_embed()
@@ -162,6 +179,12 @@ void MolaVizImGuiCore::shutdown_for_embed()
     wd.background_scene_view.reset();
   }
   windows_.clear();
+
+  if (embed_implot_ctx_)
+  {
+    ImPlot::DestroyContext(embed_implot_ctx_);
+    embed_implot_ctx_ = nullptr;
+  }
 
   embed_active_ = false;
 }
@@ -245,6 +268,14 @@ void MolaVizImGuiCore::spin_one_frame(const window_name_t& name)
   }
 
   render_sensor_windows(name, wd);
+  if (console_enabled_)
+  {
+    render_console_window(wd);
+  }
+  if (plots_enabled_)
+  {
+    render_plot_windows(wd);
+  }
   render_console_overlay(wd);
   internal_handle_decaying_clouds(wd);
 }
@@ -273,17 +304,69 @@ void MolaVizImGuiCore::render_frame(const window_name_t& name, PerWindowData& wd
   ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
   ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
 
-  constexpr ImGuiWindowFlags dockspace_flags =
-      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize |
-      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_MenuBar |
-      ImGuiWindowFlags_NoBackground;
+  ImGuiWindowFlags dockspace_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+                                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                     ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                     ImGuiWindowFlags_NoBackground;
+  if (menu_bar_enabled_)
+  {
+    dockspace_flags |= ImGuiWindowFlags_MenuBar;
+  }
 
   ImGui::Begin("##DockSpaceRoot", nullptr, dockspace_flags);
   ImGui::PopStyleVar(3);
 
-  render_menu_bar(wd);
+  if (menu_bar_enabled_)
+  {
+    render_menu_bar(wd);
+  }
 
   ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
+
+  // The dockspace node normally comes into existence lazily on the first
+  // ImGui::DockSpace() call below, but the DockBuilder calls just after this
+  // need it to already exist. Create it once, without touching a layout
+  // that may already have been loaded from imgui.ini for this same ID. A
+  // freshly-added node has no children yet, so it *is* the sole leaf/
+  // passthrough area so far; track that in `dock_central_id` since, once
+  // this ID is later split (below, or from a Dataset_UI panel), the root ID
+  // itself becomes a non-leaf parent node and can no longer be split
+  // directly. For a layout already loaded from imgui.ini, resolve the
+  // actual passthrough leaf via DockBuilderGetCentralNode() instead (retried
+  // every frame until it resolves, in case it isn't populated yet on the
+  // very first frame).
+  if (!ImGui::DockBuilderGetNode(dockspace_id))
+  {
+    ImGui::DockBuilderAddNode(
+        dockspace_id, ImGuiDockNodeFlags_PassthruCentralNode | ImGuiDockNodeFlags_DockSpace);
+    ImGui::DockBuilderSetNodeSize(dockspace_id, viewport->Size);
+    wd.dock_central_id = dockspace_id;
+  }
+  else if (wd.dock_central_id == 0)
+  {
+    if (ImGuiDockNode* central = ImGui::DockBuilderGetCentralNode(dockspace_id))
+    {
+      wd.dock_central_id = central->ID;
+    }
+  }
+
+  // Dock the Console window at the bottom the first time it appears in this
+  // profile: either a genuinely fresh imgui.ini, or an older saved layout
+  // that predates the Console feature and therefore has no saved entry for
+  // it yet. Runs once; if the window already has a saved entry (including
+  // one left floating by the user on purpose), it is left untouched.
+  if (console_enabled_ && !wd.console_dock_defaulted)
+  {
+    wd.console_dock_defaulted = true;
+    if (wd.dock_central_id != 0 && !ImGui::FindWindowSettingsByID(ImHashStr("Console")))
+    {
+      ImGuiID dock_id_bottom = ImGui::DockBuilderSplitNode(
+          wd.dock_central_id, ImGuiDir_Down, 0.25f, nullptr, &wd.dock_central_id);
+      ImGui::DockBuilderDockWindow("Console", dock_id_bottom);
+      ImGui::DockBuilderFinish(dockspace_id);
+    }
+  }
+
   ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_PassthruCentralNode);
   ImGui::End();
 
@@ -298,6 +381,14 @@ void MolaVizImGuiCore::render_frame(const window_name_t& name, PerWindowData& wd
   }
 
   render_sensor_windows(name, wd);
+  if (console_enabled_)
+  {
+    render_console_window(wd);
+  }
+  if (plots_enabled_)
+  {
+    render_plot_windows(wd);
+  }
   render_console_overlay(wd);
   internal_handle_decaying_clouds(wd);
 
@@ -346,12 +437,34 @@ void MolaVizImGuiCore::internal_drain_task_queue()
 // Rendering helpers
 // ---------------------------------------------------------------------------
 
+void MolaVizImGuiCore::render_app_menu()
+{
+  if (!ImGui::BeginMenu("MOLA"))
+  {
+    return;
+  }
+
+  if (ImGui::MenuItem("Quit") && quit_callback_)
+  {
+    quit_callback_();
+  }
+
+  ImGui::EndMenu();
+}
+
 void MolaVizImGuiCore::render_menu_bar(PerWindowData& wd)
 {
-  if (wd.menu_bar.menus.empty()) return;
-
+  // The "MOLA" and built-in "View" menus are always available, even if no
+  // module has installed a custom menu bar via set_menu_bar().
   if (ImGui::BeginMenuBar())
   {
+    render_app_menu();
+
+    if (plots_enabled_)
+    {
+      render_view_menu(wd);
+    }
+
     for (const auto& menu : wd.menu_bar.menus)
     {
       if (ImGui::BeginMenu(menu.label.c_str()))
@@ -372,6 +485,39 @@ void MolaVizImGuiCore::render_menu_bar(PerWindowData& wd)
     }
     ImGui::EndMenuBar();
   }
+}
+
+void MolaVizImGuiCore::render_view_menu(PerWindowData& wd)
+{
+  if (!ImGui::BeginMenu("View"))
+  {
+    return;
+  }
+
+  if (ImGui::MenuItem("New plot window"))
+  {
+    PlotWindowState st;
+    st.title        = "Plot " + std::to_string(wd.next_plot_id++);
+    st.span_seconds = static_cast<float>(plots_default_span_seconds_);
+    wd.plot_windows.push_back(std::move(st));
+  }
+
+  if (!wd.plot_windows.empty() || console_enabled_)
+  {
+    ImGui::Separator();
+  }
+
+  if (console_enabled_)
+  {
+    ImGui::MenuItem("Console", nullptr, &wd.console_open);
+  }
+
+  for (auto& st : wd.plot_windows)
+  {
+    ImGui::MenuItem(st.title.c_str(), nullptr, &st.open);
+  }
+
+  ImGui::EndMenu();
 }
 
 void MolaVizImGuiCore::render_background_scene(PerWindowData& wd)
@@ -447,6 +593,335 @@ void MolaVizImGuiCore::render_console_overlay(PerWindowData& wd)
   }
 
   ImGui::End();
+}
+
+namespace
+{
+ImVec4 color_for_level(mrpt::system::VerbosityLevel level)
+{
+  switch (level)
+  {
+    case mrpt::system::LVL_DEBUG:
+      return ImVec4(0.6f, 0.6f, 0.6f, 1.0f);
+    case mrpt::system::LVL_WARN:
+      return ImVec4(1.0f, 0.85f, 0.3f, 1.0f);
+    case mrpt::system::LVL_ERROR:
+      return ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+    case mrpt::system::LVL_INFO:
+    default:
+      return ImVec4(0.9f, 0.9f, 0.9f, 1.0f);
+  }
+}
+
+bool contains_ci(std::string_view hay, std::string_view needle)
+{
+  auto to_lower = [](std::string_view s)
+  {
+    std::string r(s);
+    std::transform(r.begin(), r.end(), r.begin(), [](unsigned char c) { return std::tolower(c); });
+    return r;
+  };
+  return to_lower(hay).find(to_lower(needle)) != std::string::npos;
+}
+
+std::string format_console_line(const ConsoleLogEntry& e)
+{
+  mrpt::system::TTimeParts parts;
+  mrpt::system::timestampToParts(e.timestamp, parts, /*localTime=*/true);
+  const unsigned int millisec =
+      static_cast<unsigned int>((parts.second - static_cast<unsigned int>(parts.second)) * 1000);
+  return mrpt::format(
+      "[%02u:%02u:%02u.%03u] [%s] %s", parts.hour, parts.minute,
+      static_cast<unsigned int>(parts.second), millisec, e.source.c_str(), e.text.c_str());
+}
+}  // namespace
+
+bool MolaVizImGuiCore::console_entry_passes_filters(const ConsoleLogEntry& e) const
+{
+  const double now    = mrpt::Clock::nowDouble();
+  const double maxAge = console_window_seconds_;
+  if (maxAge > 0 && now - mrpt::Clock::toDouble(e.timestamp) > maxAge) return false;
+
+  if (!console_level_enabled_[static_cast<int>(e.level)]) return false;
+
+  if (!console_selected_source_name_.empty() && e.source != console_selected_source_name_)
+    return false;
+
+  if (!console_filter_text_.empty() && !contains_ci(e.text, console_filter_text_) &&
+      !contains_ci(e.source, console_filter_text_))
+    return false;
+
+  return true;
+}
+
+void MolaVizImGuiCore::console_save_to_file()
+{
+  const std::string fname = "mola_console_" +
+                            mrpt::system::fileNameStripInvalidChars(
+                                mrpt::system::dateTimeLocalToString(mrpt::Clock::now())) +
+                            ".txt";
+
+  std::ofstream f(fname);
+  if (!f)
+  {
+    MRPT_LOG_ERROR_STREAM("Console: could not open '" << fname << "' for writing.");
+    return;
+  }
+
+  for (const auto& e : console_sink_->snapshot())
+  {
+    if (!console_entry_passes_filters(e)) continue;
+    f << format_console_line(e) << "\n";
+  }
+  MRPT_LOG_INFO_STREAM("Console: saved log to '" << fname << "'.");
+}
+
+void MolaVizImGuiCore::render_console_window(PerWindowData& wd)
+{
+  if (!console_sink_ || !wd.console_open)
+  {
+    return;
+  }
+
+  ImGui::SetNextWindowSize(ImVec2(700, 300), ImGuiCond_FirstUseEver);
+  if (!ImGui::Begin("Console", &wd.console_open))
+  {
+    ImGui::End();
+    return;
+  }
+
+  // ---- Toolbar row --------------------------------------------------------
+  if (ImGui::SmallButton("Clear")) console_sink_->clear();
+  ImGui::SameLine();
+  const bool wantSave = ImGui::SmallButton("Save");
+  ImGui::SameLine();
+
+  ImGui::SetNextItemWidth(180);
+  ImGui::InputTextWithHint("##filter", "Filter (substring)", &console_filter_text_);
+  ImGui::SameLine();
+
+  const std::vector<std::string> srcs = console_sink_->sources();
+  std::vector<const char*>       items;
+  items.push_back("all");
+  for (const auto& s : srcs) items.push_back(s.c_str());
+
+  // Re-derive the combo index from the selected *name* every frame, since
+  // `srcs` is a sorted set whose order shifts as new modules register --
+  // an index alone would silently start pointing at a different source.
+  int selCombo = 0;
+  if (!console_selected_source_name_.empty())
+  {
+    const auto it = std::find(srcs.begin(), srcs.end(), console_selected_source_name_);
+    if (it != srcs.end())
+      selCombo = static_cast<int>(it - srcs.begin()) + 1;
+    else
+      console_selected_source_name_.clear();
+  }
+
+  ImGui::SetNextItemWidth(160);
+  if (ImGui::Combo("Source", &selCombo, items.data(), static_cast<int>(items.size())))
+    console_selected_source_name_ = selCombo > 0 ? srcs[static_cast<size_t>(selCombo - 1)] : "";
+  ImGui::SameLine();
+
+  static const char* kCaptureLevelNames[] = {"Debug", "Info", "Warn", "Error"};
+  int                captureIdx           = static_cast<int>(console_capture_level_.load());
+  ImGui::SetNextItemWidth(100);
+  if (ImGui::Combo("Capture", &captureIdx, kCaptureLevelNames, IM_ARRAYSIZE(kCaptureLevelNames)))
+    console_capture_level_.store(static_cast<mrpt::system::VerbosityLevel>(captureIdx));
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "Verbosity threshold sent by every module to this console (pipeline-wide).\n"
+        "Raising it to Debug makes ALL modules pay the cost of formatting debug\n"
+        "log lines, even ones the Levels filter below then hides.\n"
+        "The Levels checkboxes only filter what's already been captured.");
+
+  ImGui::TextUnformatted("Levels:");
+  ImGui::SameLine();
+  ImGui::Checkbox("D", &console_level_enabled_[0]);
+  ImGui::SameLine();
+  ImGui::Checkbox("I", &console_level_enabled_[1]);
+  ImGui::SameLine();
+  ImGui::Checkbox("W", &console_level_enabled_[2]);
+  ImGui::SameLine();
+  ImGui::Checkbox("E", &console_level_enabled_[3]);
+  ImGui::SameLine();
+  ImGui::Checkbox("Autoscroll", &console_autoscroll_);
+
+  ImGui::Separator();
+
+  // ---- Log area -------------------------------------------------------------
+  // Re-snapshot the sink only when it actually changed (version bump on
+  // push()/clear()). Producer threads (module loggers) and this GUI thread
+  // both contend on the sink's mutex; a plain snapshot() on every rendered
+  // frame -- regardless of whether new entries arrived -- copies the whole
+  // (up to `max_entries`) deque under that lock at up to `target_fps_` Hz,
+  // which is wasted work when logging is idle or between bursts, and briefly
+  // blocks any module trying to push() a new line while the copy runs.
+  // Read the version *before* copying: if a push() races in between and
+  // lands in the copy anyway, we'll just re-snapshot once more than strictly
+  // needed next frame -- reading it after the copy could instead record a
+  // version newer than what was actually captured, permanently hiding that
+  // entry until the next push happens to change the version again.
+  if (const uint64_t v = console_sink_->version(); v != console_cached_version_)
+  {
+    console_cached_entries_ = console_sink_->snapshot();
+    console_cached_version_ = v;
+  }
+
+  ImGui::BeginChild("##log", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+
+  for (const auto& e : console_cached_entries_)
+  {
+    if (!console_entry_passes_filters(e)) continue;
+
+    const ImVec4 col = color_for_level(e.level);
+    ImGui::PushStyleColor(ImGuiCol_Text, col);
+    ImGui::TextUnformatted(format_console_line(e).c_str());
+    ImGui::PopStyleColor();
+  }
+
+  if (console_autoscroll_ && ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+    ImGui::SetScrollHereY(1.0f);
+
+  ImGui::EndChild();
+  ImGui::End();
+
+  if (wantSave) console_save_to_file();
+}
+
+void MolaVizImGuiCore::render_plot_toolbar(PlotWindowState& st)
+{
+  static constexpr float       kSpans[]      = {1.0f, 2.0f, 5.0f, 10.0f};
+  static constexpr const char* kSpanLabels[] = {"1s", "2s", "5s", "10s"};
+
+  int spanIdx = 2;  // fall back to 5s if span_seconds doesn't match a preset
+  for (size_t i = 0; i < IM_ARRAYSIZE(kSpans); i++)
+  {
+    if (std::abs(kSpans[i] - st.span_seconds) < 1e-3f) spanIdx = static_cast<int>(i);
+  }
+  ImGui::SetNextItemWidth(70);
+  if (ImGui::Combo("Span", &spanIdx, kSpanLabels, IM_ARRAYSIZE(kSpanLabels)))
+  {
+    st.span_seconds = kSpans[spanIdx];
+  }
+  ImGui::SameLine();
+
+  // "Add channel" combo, populated with channels not already shown here.
+  const std::vector<std::string> allNames = metrics_->channel_names();
+  std::vector<std::string>       avail;
+  for (const auto& n : allNames)
+  {
+    if (std::find(st.channels.begin(), st.channels.end(), n) == st.channels.end())
+    {
+      avail.push_back(n);
+    }
+  }
+  std::vector<const char*> availLabels;
+  availLabels.reserve(avail.size());
+  for (const auto& n : avail) availLabels.push_back(n.c_str());
+
+  int addIdx = -1;
+  ImGui::SetNextItemWidth(200);
+  if (ImGui::Combo(
+          "Add channel", &addIdx, availLabels.data(), static_cast<int>(availLabels.size())) &&
+      addIdx >= 0)
+  {
+    st.channels.push_back(avail[static_cast<size_t>(addIdx)]);
+  }
+
+  ImGui::Checkbox("Grid X", &st.show_grid_x);
+  ImGui::SameLine();
+  ImGui::Checkbox("Grid Y", &st.show_grid_y);
+  ImGui::SameLine();
+  ImGui::Checkbox("Legend", &st.show_legend);
+  ImGui::SameLine();
+  ImGui::Checkbox("Lines", &st.lines);
+  ImGui::SameLine();
+  ImGui::Checkbox("Y autoscale", &st.y_autoscale);
+  ImGui::SameLine();
+  ImGui::Checkbox("Pause", &st.paused);
+
+  // One removable "chip" per subscribed channel.
+  for (size_t i = 0; i < st.channels.size();)
+  {
+    ImGui::SameLine();
+    const std::string label = st.channels[i] + " x##rm_" + st.channels[i];
+    if (ImGui::SmallButton(label.c_str()))
+    {
+      st.channels.erase(st.channels.begin() + static_cast<long>(i));
+      continue;
+    }
+    ++i;
+  }
+}
+
+void MolaVizImGuiCore::render_plot_windows(PerWindowData& wd)
+{
+  bool anyOpenWithChannels = false;
+
+  for (auto& st : wd.plot_windows)
+  {
+    if (!st.open) continue;
+
+    ImGui::SetNextWindowSize(ImVec2(480, 320), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin(st.title.c_str(), &st.open))
+    {
+      render_plot_toolbar(st);
+      if (!st.channels.empty()) anyOpenWithChannels = true;
+
+      const double now  = mrpt::Clock::nowDouble();
+      const double tmin = now - static_cast<double>(st.span_seconds);
+
+      // Widen (never shrink) each shown channel's retention to cover this
+      // window's span, so copy_span() below always finds the full history.
+      const double wantRetention =
+          std::max(plots_default_retention_seconds_, static_cast<double>(st.span_seconds));
+      for (const auto& chName : st.channels)
+      {
+        auto ch = metrics_->find(chName);
+        if (!ch) continue;
+        if (wantRetention > ch->retention_seconds.load(std::memory_order_relaxed))
+          ch->retention_seconds.store(wantRetention, std::memory_order_relaxed);
+      }
+
+      const ImPlotFlags plotFlags = st.show_legend ? ImPlotFlags_None : ImPlotFlags_NoLegend;
+      if (ImPlot::BeginPlot(("##" + st.title).c_str(), ImVec2(-1, -1), plotFlags))
+      {
+        const ImPlotAxisFlags xFlags =
+            st.show_grid_x ? ImPlotAxisFlags_None : ImPlotAxisFlags_NoGridLines;
+        const ImPlotAxisFlags yFlags =
+            (st.show_grid_y ? ImPlotAxisFlags_None : ImPlotAxisFlags_NoGridLines) |
+            (st.y_autoscale ? ImPlotAxisFlags_AutoFit : ImPlotAxisFlags_None);
+        ImPlot::SetupAxes("t [s]", nullptr, xFlags, yFlags);
+        if (!st.paused) ImPlot::SetupAxisLimits(ImAxis_X1, tmin, now, ImPlotCond_Always);
+
+        for (const auto& chName : st.channels)
+        {
+          auto ch = metrics_->find(chName);
+          if (!ch) continue;
+
+          ch->copy_span(tmin, plot_scratch_xs_, plot_scratch_ys_);
+          if (plot_scratch_xs_.empty()) continue;
+
+          ImPlotSpec spec;
+          spec.LineColor      = ch->color;
+          const auto        n = static_cast<int>(plot_scratch_xs_.size());
+          const std::string label =
+              ch->unit.empty() ? ch->name : (ch->name + " [" + ch->unit + "]");
+          if (st.lines)
+            ImPlot::PlotLine(
+                label.c_str(), plot_scratch_xs_.data(), plot_scratch_ys_.data(), n, spec);
+          else
+            ImPlot::PlotScatter(
+                label.c_str(), plot_scratch_xs_.data(), plot_scratch_ys_.data(), n, spec);
+        }
+        ImPlot::EndPlot();
+      }
+    }
+    ImGui::End();
+  }
+
+  metrics_->any_window_open()->store(anyOpenWithChannels, std::memory_order_relaxed);
 }
 
 void MolaVizImGuiCore::render_subwindow(SubWindowState& sw)
@@ -567,9 +1042,40 @@ std::future<void> MolaVizImGuiCore::create_subwindow_from_description(
               "create_subwindow_from_description(): unknown parentWindow '" << parentWindow << "'");
           return;
         }
-        auto& sw      = it->second.sub_windows[desc.title];
+        auto&      wd          = it->second;
+        const bool isNewWindow = wd.sub_windows.count(desc.title) == 0;
+
+        auto& sw      = wd.sub_windows[desc.title];
         sw.desc       = desc;
         sw.active_tab = 0;
+
+        // The first time a window that requests it (e.g. a Dataset_UI
+        // panel) appears without a saved imgui.ini entry of its own, dock
+        // it into a strip reserved at the top of the main window instead of
+        // leaving it floating. Skipped if the window already has a saved
+        // entry (including one the user has since moved elsewhere on
+        // purpose). Must run before the window's first ImGui::Begin(),
+        // which is guaranteed here since this task queue is drained before
+        // sub-windows are rendered each frame.
+        if (isNewWindow && desc.dock_top_by_default &&
+            !ImGui::FindWindowSettingsByID(ImHashStr(desc.title.c_str())))
+        {
+          // Split off the *current* remaining passthrough leaf (tracked in
+          // `dock_central_id`, kept up to date by render_frame() and by
+          // every split below), not the dockspace root: once any split has
+          // happened the root ID becomes a non-leaf parent node and can no
+          // longer be split directly.
+          if (wd.default_dock_top_id == 0 && wd.dock_central_id != 0)
+          {
+            wd.default_dock_top_id = ImGui::DockBuilderSplitNode(
+                wd.dock_central_id, ImGuiDir_Up, 0.12f, nullptr, &wd.dock_central_id);
+            ImGui::DockBuilderFinish(ImGui::GetID("MainDockSpace"));
+          }
+          if (wd.default_dock_top_id != 0)
+          {
+            ImGui::DockBuilderDockWindow(desc.title.c_str(), wd.default_dock_top_id);
+          }
+        }
       });
 }
 
@@ -596,6 +1102,19 @@ std::future<void> MolaVizImGuiCore::set_menu_bar(
         }
         it->second.menu_bar = bar;
       });
+}
+
+MetricChannel::Ptr MolaVizImGuiCore::register_metric(
+    const std::string& name, const std::string& unit)
+{
+  auto ch = metrics_->get_or_create(name, unit);
+  ch->retention_seconds.store(plots_default_retention_seconds_, std::memory_order_relaxed);
+  return ch;
+}
+
+void MolaVizImGuiCore::push_metric(const std::string& name, double t, double value)
+{
+  metrics_->get_or_create(name, "")->push(t, value);
 }
 
 std::future<std::optional<std::string>> MolaVizImGuiCore::open_file_dialog(
@@ -1039,42 +1558,4 @@ std::future<bool> MolaVizImGuiCore::output_console_message(
   std::lock_guard lk(guiThreadPendingTasksMtx_);
   guiThreadPendingTasks_.emplace_back([=]() { (*task)(); });
   return task->get_future();
-}
-
-// ---------------------------------------------------------------------------
-// VizInterface: deprecated stubs
-// ---------------------------------------------------------------------------
-
-std::future<nanogui::Window*> MolaVizImGuiCore::create_subwindow(
-    const std::string& title, const std::string& parentWindow)
-{
-  mola::gui::WindowDescription desc;
-  desc.title = title;
-  create_subwindow_from_description(desc, parentWindow);
-
-  std::promise<nanogui::Window*> p;
-  p.set_value(nullptr);
-  return p.get_future();
-}
-
-std::future<void> MolaVizImGuiCore::enqueue_custom_nanogui_code(const std::function<void()>& fn)
-{
-  return enqueue_custom_gui_code(fn);
-}
-
-std::future<void> MolaVizImGuiCore::subwindow_grid_layout(
-    const std::string&, bool, int, const std::string&)
-{
-  std::promise<void> p;
-  p.set_value();
-  return p.get_future();
-}
-
-std::future<void> MolaVizImGuiCore::subwindow_move_resize(
-    const std::string&, const mrpt::math::TPoint2D_<int>&, const mrpt::math::TPoint2D_<int>&,
-    const std::string&)
-{
-  std::promise<void> p;
-  p.set_value();
-  return p.get_future();
 }

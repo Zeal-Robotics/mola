@@ -103,6 +103,14 @@ class MolaViz : public ExecutableBase, public VizInterface
       const mola::gui::MenuBar& bar,
       const std::string&        parentWindow = DEFAULT_WINDOW_NAME) override;
 
+  /** Metrics plotting is an ImGui-backend feature. Returns a no-op handle
+   *  whose push() does nothing. */
+  MetricChannel::Ptr register_metric(
+      const std::string& name, const std::string& unit = "") override;
+
+  /** Does nothing in nanogui backend. */
+  void push_metric(const std::string& name, double t, double value) override;
+
   /** @} */
 
   // =========================================================================
@@ -167,38 +175,6 @@ class MolaViz : public ExecutableBase, public VizInterface
 
   std::future<bool> output_console_message(
       const std::string& message, const std::string& parentWindow = DEFAULT_WINDOW_NAME) override;
-
-  /** @} */
-
-  // =========================================================================
-  /** @name VizInterface - deprecated nanogui-specific API
-   *
-   * All three methods delegate to their replacements above.
-   * They will be removed in a future release.
-   * @{ */
-
-  /// \deprecated Use create_subwindow_from_description() instead.
-  [[deprecated("Use create_subwindow_from_description() instead")]] std::future<nanogui::Window*>
-      create_subwindow(
-          const std::string& subWindowTitle,
-          const std::string& parentWindow = DEFAULT_WINDOW_NAME) override;
-
-  /// \deprecated Use enqueue_custom_gui_code() instead.
-  [[deprecated("Use enqueue_custom_gui_code() instead")]] std::future<void>
-      enqueue_custom_nanogui_code(const std::function<void()>& userCode) override;
-
-  /// \deprecated Encode layout in WindowDescription instead.
-  [[deprecated("Encode layout in WindowDescription instead")]] std::future<void>
-      subwindow_grid_layout(
-          const std::string& subWindowTitle, bool orientationVertical, int resolution,
-          const std::string& parentWindow = DEFAULT_WINDOW_NAME) override;
-
-  /// \deprecated Encode position/size in WindowDescription instead.
-  [[deprecated("Encode position/size in WindowDescription instead")]] std::future<void>
-      subwindow_move_resize(
-          const std::string& subWindowTitle, const mrpt::math::TPoint2D_<int>& location,
-          const mrpt::math::TPoint2D_<int>& size,
-          const std::string&                parentWindow = DEFAULT_WINDOW_NAME) override;
 
   /** @} */
 

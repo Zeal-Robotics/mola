@@ -37,6 +37,8 @@ add_subdirectory(3rdparty/imgui_static imgui_static_build)
 
 # -- Module sources -----------------------------------------------------------
 set(LIB_SRCS
+  src/ConsoleLogSink.cpp
+  src/MetricsRegistry.cpp
   src/MolaVizImGuiCore.cpp
   src/MolaVizImGui_handlers.cpp
   src/MolaVizImGui.cpp

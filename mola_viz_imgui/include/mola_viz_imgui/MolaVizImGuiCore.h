@@ -33,16 +33,59 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
-// Forward declaration: only GLFWwindow* pointers appear in this header, so the
-// GLFW/OpenGL backend headers are pulled in by the .cpp implementation files
-// instead of being forced on every consumer of the public API.
+// Forward declarations: only pointers to these types appear in this header,
+// so the GLFW/OpenGL/ImPlot headers are pulled in by the .cpp implementation
+// files instead of being forced on every consumer of the public API.
 struct GLFWwindow;
+struct ImPlotContext;
 
 namespace mola
 {
+
+// Defined in MetricsRegistry.h (kept out of the public include dir; only
+// this Core uses the concrete type). The public handle modules interact
+// with is the kernel's mola::MetricChannel.
+class MetricsRegistry;
+
+/** One captured log line, tagged with its originating module and severity. */
+struct ConsoleLogEntry
+{
+  mrpt::Clock::time_point      timestamp;
+  mrpt::system::VerbosityLevel level = mrpt::system::LVL_INFO;
+  std::string                  source;  // module instance name
+  std::string                  text;  // single line (already split on \n)
+};
+
+/** Thread-safe rolling store of captured log lines, bounded by entry count.
+ *  Shared (shared_ptr) between MolaVizImGuiCore and the per-module logger
+ *  callbacks, so it outlives any module still holding a callback. */
+class ConsoleLogSink
+{
+ public:
+  void                        push(const ConsoleLogEntry& e);
+  std::deque<ConsoleLogEntry> snapshot() const;
+  void                        clear();
+  void                        note_source(const std::string& s);
+  std::vector<std::string>    sources() const;
+
+  /** Bumped on every push()/clear(). Lock-free, so callers that re-render
+   *  every frame (e.g. the Console window) can skip the snapshot()/lock/copy
+   *  entirely when nothing changed since their last cached copy. */
+  uint64_t version() const { return version_.load(std::memory_order_relaxed); }
+
+  std::atomic<size_t> max_entries{5000};
+  std::atomic<double> window_seconds{120.0};
+
+ private:
+  mutable std::mutex          mtx_;
+  std::deque<ConsoleLogEntry> entries_;
+  std::set<std::string>       sources_;
+  std::atomic<uint64_t>       version_{0};
+};
 
 /** Core rendering and state-management logic for the Dear ImGui MOLA viz backend.
  *
@@ -191,6 +234,11 @@ class MolaVizImGuiCore : public VizInterface, public mrpt::system::COutputLogger
       const mola::gui::MenuBar& bar,
       const std::string&        parentWindow = DEFAULT_WINDOW_NAME) override;
 
+  MetricChannel::Ptr register_metric(
+      const std::string& name, const std::string& unit = "") override;
+
+  void push_metric(const std::string& name, double t, double value) override;
+
   /** @} */
   // =========================================================================
   /** @name VizInterface — 3-D scene API
@@ -255,26 +303,6 @@ class MolaVizImGuiCore : public VizInterface, public mrpt::system::COutputLogger
 
   /** @} */
   // =========================================================================
-  /** @name VizInterface — deprecated nanogui stubs
-   * @{ */
-
-  [[deprecated]] std::future<nanogui::Window*> create_subwindow(
-      const std::string& title, const std::string& parentWindow = DEFAULT_WINDOW_NAME) override;
-
-  [[deprecated]] std::future<void> enqueue_custom_nanogui_code(
-      const std::function<void()>& userCode) override;
-
-  [[deprecated]] std::future<void> subwindow_grid_layout(
-      const std::string& subWindowTitle, bool orientationVertical, int resolution,
-      const std::string& parentWindow = DEFAULT_WINDOW_NAME) override;
-
-  [[deprecated]] std::future<void> subwindow_move_resize(
-      const std::string& subWindowTitle, const mrpt::math::TPoint2D_<int>& location,
-      const mrpt::math::TPoint2D_<int>& size,
-      const std::string&                parentWindow = DEFAULT_WINDOW_NAME) override;
-
-  /** @} */
-  // =========================================================================
   /** @name GUI update handler registry
    * @{ */
 
@@ -314,6 +342,60 @@ class MolaVizImGuiCore : public VizInterface, public mrpt::system::COutputLogger
    */
   std::string imgui_app_name_ = "default";
 
+  /** Console subwindow: master enable. When false, no log interception and
+   *  the Console window is not shown. */
+  bool console_enabled_ = true;
+
+  /** Max number of captured log entries kept in the rolling buffer. */
+  unsigned int console_max_entries_ = 5000;
+
+  /** Rolling time window (seconds): entries older than this are dropped. */
+  double console_window_seconds_ = 120.0;
+
+  /** Verbosity threshold used when registering module log callbacks (i.e.
+   *  what gets captured pipeline-wide, as opposed to `console_level_enabled_`
+   *  below, which only filters what the already-captured entries display).
+   *  Default INFO: capturing DEBUG from every module forces every
+   *  MRPT_LOG_DEBUG_STREAM() callsite in the whole pipeline to always format
+   *  its message just to feed the sink, even if the UI ends up hiding it.
+   *  Runtime-adjustable from the Console window's "Capture" combo; atomic
+   *  because it's written from the GUI thread and read from the module's
+   *  own spin thread (see `MolaVizImGui::console_check_new_modules()`). */
+  std::atomic<mrpt::system::VerbosityLevel> console_capture_level_{mrpt::system::LVL_INFO};
+
+  /** Sink shared with the per-module logger callbacks; always allocated,
+   *  populated only while `console_enabled_` is true. */
+  std::shared_ptr<ConsoleLogSink> console_sink_ = std::make_shared<ConsoleLogSink>();
+
+  /** Top main menu bar (host mode only): master enable. When false, no menu
+   *  bar is created at all (including the "MOLA" and built-in "View" menus,
+   *  and any module-installed menu via `set_menu_bar()`). Existing
+   *  plot/console windows are unaffected; only the top strip and its menus
+   *  disappear. */
+  bool menu_bar_enabled_ = true;
+
+  /** Invoked when the user clicks "Quit" in the "MOLA" menu (host mode only).
+   *  Set by `MolaVizImGui::initialize()` to request shutdown of the whole
+   *  MOLA application. Left unset (no-op) outside of that context, e.g. when
+   *  the Core is driven directly in embed mode. */
+  std::function<void()> quit_callback_;
+
+  /** Plot windows: master enable for the plot-window items in the "View" menu
+   *  and metric registration. When false, register_metric()/push_metric()
+   *  still return valid (no-op) channels so callers never need to guard the
+   *  call. */
+  bool plots_enabled_ = true;
+
+  /** Default rolling-history cap (seconds) for a newly-registered channel. */
+  double plots_default_retention_seconds_ = 10.0;
+
+  /** Default horizontal span (seconds) of a newly-created plot window. */
+  double plots_default_span_seconds_ = 5.0;
+
+  /** Registry of metric channels shared with the per-module producer handles;
+   *  always allocated, like `console_sink_`. See MetricsRegistry.h. */
+  std::shared_ptr<MetricsRegistry> metrics_;
+
   /** @} */
 
   // =========================================================================
@@ -345,6 +427,26 @@ class MolaVizImGuiCore : public VizInterface, public mrpt::system::COutputLogger
     std::shared_ptr<mrpt::opengl::CPointCloudColoured> cloud;
     mrpt::opengl::CSetOfObjects::Ptr container;  // owning container at insert time
     float                            initial_alpha = 1.0f;
+  };
+
+  /** One live plot window: which channels it overlays and its display options.
+   *  Opened from the built-in "View" menu; independently closable/reopenable
+   *  via its native `[x]` button and the same menu, mirroring how the Console
+   *  window's visibility is toggled. */
+  struct PlotWindowState
+  {
+    std::string title;  // e.g. "Plot 1"; unique within a PerWindowData
+    bool        open = true;  // drives ImGui::Begin(title, &open) -> [x] button
+
+    std::vector<std::string> channels;  // subscribed channel names (overlaid)
+
+    float span_seconds = 5.0f;  // horizontal window shown, one of {1,2,5,10}
+    bool  show_grid_x  = true;
+    bool  show_grid_y  = true;
+    bool  show_legend  = true;
+    bool  lines        = true;  // true=solid lines, false=ticks/markers only
+    bool  y_autoscale  = true;
+    bool  paused       = false;  // freeze the view for inspection
   };
 
   struct PerWindowData
@@ -379,6 +481,35 @@ class MolaVizImGuiCore : public VizInterface, public mrpt::system::COutputLogger
     size_t                    max_decaying_clouds = 100;
 
     mola::gui::MenuBar menu_bar;
+
+    /** Drives the Console window's native `[x]` button; the "View" menu's
+     *  checklist re-opens it, same mechanism as the plot windows below. */
+    bool console_open = true;
+
+    /** Open plot windows for this parent window; created via the "View"
+     *  menu, each independently closable/reopenable. */
+    std::vector<PlotWindowState> plot_windows;
+    int                          next_plot_id = 1;
+
+    /** Set once `render_frame()` has attempted the Console's default
+     *  bottom-dock, so it only runs once per session. The attempt itself is
+     *  a no-op if the Console already has a saved imgui.ini entry (its own
+     *  or a user-moved one). */
+    bool console_dock_defaulted = false;
+
+    /** ID of the dock node currently acting as the "remaining" passthrough
+     *  area available for further default-dock splits (Console, then any
+     *  `dock_top_by_default` window). Splitting off a slice always updates
+     *  this to the new remainder, since after a node is split its own ID
+     *  becomes a non-leaf parent and can no longer be split directly. Zero
+     *  until the dockspace node has been resolved for the first time. */
+    ImGuiID dock_central_id = 0;
+
+    /** Dock node reserved at the top of the main window, lazily created the
+     *  first time a window without a saved imgui.ini entry requests
+     *  `WindowDescription::dock_top_by_default` (e.g. a Dataset_UI panel).
+     *  Zero until then. */
+    ImGuiID default_dock_top_id = 0;
   };
 
   std::map<window_name_t, PerWindowData> windows_;
@@ -396,12 +527,23 @@ class MolaVizImGuiCore : public VizInterface, public mrpt::system::COutputLogger
   // destructor to warn the caller if they forgot to release GL resources.
   bool embed_active_ = false;
 
+  // Embed mode only: the host owns the ImGui context but has no reason to
+  // know about ImPlot, so the Core creates/destroys its own ImPlot context
+  // here. Host mode (MolaVizImGui) instead owns an ImPlot context alongside
+  // its ImGui context (see MolaVizImGui::gui_thread()).
+  ImPlotContext* embed_implot_ctx_ = nullptr;
+
   // Per-frame rendering helpers
   void render_menu_bar(PerWindowData& win);
   void render_background_scene(PerWindowData& win);
   void render_subwindow(SubWindowState& sw);
   void render_sensor_windows(const window_name_t& parentName, PerWindowData& win);
   void render_console_overlay(PerWindowData& win);
+  void render_console_window(PerWindowData& win);
+  void render_app_menu();
+  void render_view_menu(PerWindowData& win);
+  void render_plot_windows(PerWindowData& win);
+  void render_plot_toolbar(PlotWindowState& st);
   void render_widget_description(const mola::gui::WindowDescription& desc, SubWindowState& sw);
   void render_tab(const mola::gui::Tab& tab, const std::string& ctx);
   void render_any_widget(const mola::gui::AnyWidget& w, const std::string& ctx);
@@ -409,6 +551,10 @@ class MolaVizImGuiCore : public VizInterface, public mrpt::system::COutputLogger
 
   void internal_drain_task_queue();
   void internal_handle_decaying_clouds(PerWindowData& win);
+
+  // Console window: filter test shared between on-screen rendering and Save.
+  bool console_entry_passes_filters(const ConsoleLogEntry& e) const;
+  void console_save_to_file();
 
   // Cleanup callbacks registered via register_gui_cleanup().
   std::vector<std::function<void()>> instance_cleanups_;
@@ -422,6 +568,28 @@ class MolaVizImGuiCore : public VizInterface, public mrpt::system::COutputLogger
   std::map<std::string, int>         widget_slider_int_vals_;
   std::map<std::string, int>         widget_combo_indices_;
   std::map<uint64_t, std::string>    widget_textpanel_bufs_;
+
+  // Console window UI state (per instance).
+  std::string console_filter_text_;
+  bool        console_level_enabled_[4] = {false, true, true, true};  // D,I,W,E
+  bool        console_autoscroll_       = true;
+
+  // Cached copy of the sink's entries, refreshed only when `ConsoleLogSink::
+  // version()` changes -- avoids a full deque-of-strings copy under the
+  // sink's mutex on every rendered frame when nothing new was logged.
+  std::deque<ConsoleLogEntry> console_cached_entries_;
+  uint64_t                    console_cached_version_ = 0;
+
+  // Selected source filter, keyed by name (empty == "all"), not by an index
+  // into `ConsoleLogSink::sources()` -- that set is sorted and its order
+  // shifts as new modules register mid-session, so an index alone would
+  // silently start pointing at a different source.
+  std::string console_selected_source_name_;
+
+  // Plot windows: buffers reused across channels/frames to avoid a
+  // heap allocation per PlotLine() call.
+  std::vector<double> plot_scratch_xs_;
+  std::vector<double> plot_scratch_ys_;
 };
 
 }  // namespace mola

@@ -27,8 +27,13 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
+
+// Forward declaration: implot.h is only pulled in by the .cpp files that
+// need it, so it is not forced on every consumer of this public header.
+struct ImPlotContext;
 
 namespace mola
 {
@@ -137,6 +142,16 @@ class MolaVizImGui : public ExecutableBase, public VizInterface
     return core_ptr_->set_menu_bar(bar, parentWindow);
   }
 
+  MetricChannel::Ptr register_metric(const std::string& name, const std::string& unit = "") override
+  {
+    return core_ptr_->register_metric(name, unit);
+  }
+
+  void push_metric(const std::string& name, double t, double value) override
+  {
+    core_ptr_->push_metric(name, t, value);
+  }
+
   /** @} */
 
   // =========================================================================
@@ -238,40 +253,6 @@ class MolaVizImGui : public ExecutableBase, public VizInterface
   /** @} */
 
   // =========================================================================
-  /** @name VizInterface — deprecated nanogui-specific stubs
-   * @{ */
-
-  [[deprecated]] std::future<nanogui::Window*> create_subwindow(
-      const std::string& title, const std::string& parentWindow = DEFAULT_WINDOW_NAME) override
-  {
-    return core_ptr_->create_subwindow(title, parentWindow);
-  }
-
-  [[deprecated]] std::future<void> enqueue_custom_nanogui_code(
-      const std::function<void()>& userCode) override
-  {
-    return core_ptr_->enqueue_custom_nanogui_code(userCode);
-  }
-
-  [[deprecated]] std::future<void> subwindow_grid_layout(
-      const std::string& subWindowTitle, bool orientationVertical, int resolution,
-      const std::string& parentWindow = DEFAULT_WINDOW_NAME) override
-  {
-    return core_ptr_->subwindow_grid_layout(
-        subWindowTitle, orientationVertical, resolution, parentWindow);
-  }
-
-  [[deprecated]] std::future<void> subwindow_move_resize(
-      const std::string& subWindowTitle, const mrpt::math::TPoint2D_<int>& location,
-      const mrpt::math::TPoint2D_<int>& size,
-      const std::string&                parentWindow = DEFAULT_WINDOW_NAME) override
-  {
-    return core_ptr_->subwindow_move_resize(subWindowTitle, location, size, parentWindow);
-  }
-
-  /** @} */
-
-  // =========================================================================
   /** @name Handler registry (forwarded to MolaVizImGuiCore statics)
    * @{ */
 
@@ -314,7 +295,8 @@ class MolaVizImGui : public ExecutableBase, public VizInterface
   // ---------------------------------------------------------------------------
   std::thread       guiThread_;
   std::atomic<bool> guiThreadShutdown_{false};
-  ImGuiContext*     imgui_ctx_ = nullptr;
+  ImGuiContext*     imgui_ctx_  = nullptr;
+  ImPlotContext*    implot_ctx_ = nullptr;
 
   void                             gui_thread();
   MolaVizImGuiCore::PerWindowData& create_and_add_window(const window_name_t& name);
@@ -336,6 +318,14 @@ class MolaVizImGui : public ExecutableBase, public VizInterface
 
   void dataset_ui_check_new_modules();
   void dataset_ui_update();
+
+  // ---------------------------------------------------------------------------
+  // Console window: log capture from all discovered ExecutableBase modules
+  // ---------------------------------------------------------------------------
+  double                lastTimeCheckForConsoleModules_ = 0;
+  std::set<std::string> consoleHookedModules_;  // instance names already hooked
+
+  void console_check_new_modules();
 };
 
 }  // namespace mola

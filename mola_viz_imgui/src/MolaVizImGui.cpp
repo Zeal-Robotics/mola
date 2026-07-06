@@ -24,13 +24,17 @@
 #include <GLFW/glfw3.h>
 #include <imgui_impl_glfw.h>
 #include <imgui_impl_opengl3.h>
+#include <implot.h>
+#include <mola_kernel/assets/mola_icon_64x64.h>
 #include <mola_viz_imgui/MolaVizImGui.h>
 #include <mola_yaml/yaml_helpers.h>
 #include <mrpt/containers/yaml.h>
 #include <mrpt/core/initializer.h>
+#include <mrpt/system/string_utils.h>
 #include <mrpt/system/thread_name.h>
 
 #include <stdexcept>
+#include <vector>
 
 using namespace mola;
 
@@ -137,10 +141,29 @@ void MolaVizImGui::initialize(const Yaml& c)
   core_ptr_->target_fps_     = cfg.getOrDefault("target_fps", core_ptr_->target_fps_);
   core_ptr_->imgui_app_name_ = cfg.getOrDefault("imgui_app_name", core_ptr_->imgui_app_name_);
 
+  core_ptr_->console_enabled_ = cfg.getOrDefault("console_enabled", core_ptr_->console_enabled_);
+  core_ptr_->console_max_entries_ =
+      cfg.getOrDefault("console_max_entries", core_ptr_->console_max_entries_);
+  core_ptr_->console_window_seconds_ =
+      cfg.getOrDefault("console_window_seconds", core_ptr_->console_window_seconds_);
+
+  core_ptr_->plots_enabled_ = cfg.getOrDefault("plots_enabled", core_ptr_->plots_enabled_);
+  core_ptr_->plots_default_retention_seconds_ = cfg.getOrDefault(
+      "plots_default_retention_seconds", core_ptr_->plots_default_retention_seconds_);
+  core_ptr_->plots_default_span_seconds_ =
+      cfg.getOrDefault("plots_default_span_seconds", core_ptr_->plots_default_span_seconds_);
+
+  core_ptr_->menu_bar_enabled_ = cfg.getOrDefault("menu_bar_enabled", core_ptr_->menu_bar_enabled_);
+
+  core_ptr_->console_sink_->max_entries    = core_ptr_->console_max_entries_;
+  core_ptr_->console_sink_->window_seconds = core_ptr_->console_window_seconds_;
+
   {
     std::lock_guard lk(instanceMtx_);
     instance_ = this;
   }
+
+  core_ptr_->quit_callback_ = [this]() { this->requestShutdown(); };
 
   if (!embed_mode_)
   {
@@ -167,6 +190,12 @@ void MolaVizImGui::spinOnce()
     dataset_ui_update();
     lastTimeUpdateDatasetUIs_ = tNow;
   }
+
+  if (core_ptr_->console_enabled_ && tNow - lastTimeCheckForConsoleModules_ > PERIOD_CHECK_NEW_MODS)
+  {
+    console_check_new_modules();
+    lastTimeCheckForConsoleModules_ = tNow;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +217,34 @@ MolaVizImGuiCore::PerWindowData& MolaVizImGui::create_and_add_window(const windo
   const std::string title = "MOLAViz ImGui - " + name;
   GLFWwindow*       win   = glfwCreateWindow(1280, 800, title.c_str(), nullptr, nullptr);
   if (!win) throw std::runtime_error("MolaVizImGui: glfwCreateWindow failed");
+
+  {
+    // The GIMP header format used by mola_icon_data has no alpha channel, so
+    // the (0,0) corner pixel color is used as the transparent color key.
+    std::vector<unsigned char> rgba(mola_icon_width * mola_icon_height * 4);
+    const char*                data = mola_icon_data;
+
+    unsigned char transparentRgb[3];
+    {
+      const char* cornerData = mola_icon_data;
+      HEADER_PIXEL(cornerData, transparentRgb);
+    }
+
+    for (unsigned int i = 0; i < mola_icon_width * mola_icon_height; i++)
+    {
+      unsigned char rgb[3];
+      HEADER_PIXEL(data, rgb);
+      rgba[4 * i + 0] = rgb[0];
+      rgba[4 * i + 1] = rgb[1];
+      rgba[4 * i + 2] = rgb[2];
+      const bool isTransparent =
+          rgb[0] == transparentRgb[0] && rgb[1] == transparentRgb[1] && rgb[2] == transparentRgb[2];
+      rgba[4 * i + 3] = isTransparent ? 0x00 : 0xff;
+    }
+    const GLFWimage icon_image{
+        static_cast<int>(mola_icon_width), static_cast<int>(mola_icon_height), rgba.data()};
+    glfwSetWindowIcon(win, 1, &icon_image);
+  }
 
   glfwMakeContextCurrent(win);
   glfwSwapInterval(0);
@@ -226,6 +283,7 @@ void MolaVizImGui::gui_thread()
 
   imgui_ctx_ = ImGui::CreateContext();
   ImGui::SetCurrentContext(imgui_ctx_);
+  implot_ctx_ = ImPlot::CreateContext();
 
   create_and_add_window(DEFAULT_WINDOW_NAME);
 
@@ -272,6 +330,9 @@ void MolaVizImGui::gui_thread()
     wd.glfw_window = nullptr;
   }
   core_ptr_->windows_.clear();
+
+  ImPlot::DestroyContext(implot_ctx_);
+  implot_ctx_ = nullptr;
 
   ImGui::DestroyContext(imgui_ctx_);
   imgui_ctx_ = nullptr;
@@ -320,9 +381,10 @@ void MolaVizImGui::dataset_ui_check_new_modules()
     }
 
     mola::gui::WindowDescription desc;
-    desc.title    = module->getModuleInstanceName();
-    desc.position = {300, 5};
-    desc.size     = {650, 70};
+    desc.title               = module->getModuleInstanceName();
+    desc.position            = {300, 5};
+    desc.size                = {650, 70};
+    desc.dock_top_by_default = true;
 
     mola::gui::Tab tab{"Controls", {}};
     mola::gui::Row row;
@@ -380,5 +442,57 @@ void MolaVizImGui::dataset_ui_update()
     const size_t N   = mod->datasetUI_size();
     e.lbPlaybackPosition->set(mrpt::format("%zu / %zu", pos, N));
     if (e.liveSliderPos) e.liveSliderPos->set(static_cast<float>(pos));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Console window: log capture from all discovered ExecutableBase modules
+// ---------------------------------------------------------------------------
+
+void MolaVizImGui::console_check_new_modules()
+{
+  auto sink = core_ptr_->console_sink_;
+  if (!sink) return;
+
+  // Read once per tick: the user may have changed it at runtime via the
+  // Console window's "Capture" combo (MolaVizImGuiCore::render_console_window).
+  const auto captureLevel = core_ptr_->console_capture_level_.load();
+
+  for (auto& module : findService<ExecutableBase>())
+  {
+    if (module.get() == this) continue;  // never hook ourselves (recursion)
+
+    // Re-applied every tick (not just at hook time) so a runtime change to
+    // the capture level propagates to already-hooked modules too. Does not
+    // change what actually prints to the terminal, only what's forwarded to
+    // the console callback -- see setVerbosityLevelForCallbacks() docs.
+    module->setVerbosityLevelForCallbacks(captureLevel);
+
+    const std::string name = module->getModuleInstanceName();
+    if (consoleHookedModules_.count(name)) continue;
+    consoleHookedModules_.insert(name);
+    sink->note_source(name);
+
+    // shared_ptr capture keeps the sink alive as long as the module's logger
+    // holds this callback; 'name' (not loggerName) is captured for a stable id.
+    module->logRegisterCallback(
+        [sink, name](
+            std::string_view msg, mrpt::system::VerbosityLevel       level,
+            std::string_view /*loggerName*/, mrpt::Clock::time_point timestamp)
+        {
+          std::vector<std::string> lines;
+          mrpt::system::tokenize(std::string(msg), "\r\n", lines);
+          if (lines.empty()) lines.push_back(std::string(msg));
+
+          for (const auto& line : lines)
+          {
+            ConsoleLogEntry e;
+            e.timestamp = timestamp;
+            e.level     = level;
+            e.source    = name;
+            e.text      = line;
+            sink->push(e);
+          }
+        });
   }
 }
