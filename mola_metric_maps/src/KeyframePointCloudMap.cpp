@@ -405,7 +405,15 @@ void KeyframePointCloudMap::serializeFrom(mrpt::serialization::CArchive& in, uin
 
       if (version >= 1)
       {
-        in >> cached_.icp_search_kfs;
+        // Only kept in the stream for post-mortem debugging of ICP states;
+        // it must not be restored into the live cache. icp_search_submap (the
+        // actual prepared search structure it would otherwise validate) is
+        // never serialized, so leaving this set here would let
+        // icp_get_prepared_as_global()'s "already up to date" fast path
+        // wrongly skip rebuilding it whenever the freshly-computed active-KF
+        // selection happens to match this stale, reloaded set.
+        std::optional<std::set<KeyFrameID>> debugOnlyPriorActiveKfs;
+        in >> debugOnlyPriorActiveKfs;
       }
     }
     break;
@@ -840,6 +848,17 @@ void KeyframePointCloudMap::icp_get_prepared_as_global(  // NOLINT
     cached_.icp_search_submap->pointcloud()->insertAnotherMap(
         kf_global.get(), mrpt::poses::CPose3D::Identity());
 #endif
+  }
+
+  // If no keyframe contributed any points (the selection was empty, or every
+  // selected keyframe had a null/empty cloud), fall back to a valid empty
+  // cloud. Otherwise buildCache() and the global-frame warm-up below would
+  // dereference a null pointcloud. An empty cloud yields zero ICP
+  // correspondences (the map is simply rejected as a match), which keeps a
+  // single degenerate submap from aborting a whole background loop-closure scan.
+  if (!cached_.icp_search_submap->pointcloud())
+  {
+    cached_.icp_search_submap->pointcloud(mrpt::maps::CSimplePointsMap::Create());
   }
 
   cached_.icp_search_submap->buildCache();
@@ -1877,6 +1896,34 @@ std::shared_ptr<KeyframePointCloudMap> KeyframePointCloudMap::regroupKeyframes(
   if (n == 0)
   {
     log("[regroup] Input map has no keyframes with clouds; returning empty map.");
+    return out;
+  }
+
+  // ---- 1.5) unify_all: skip clustering, merge everything into one super-keyframe ----
+  if (params.unify_all)
+  {
+    log(mrpt::format(
+        "[regroup] unify_all: merging all %zu keyframes into a single super-keyframe", n));
+
+    const auto& seed = kfs.front();
+
+    std::vector<size_t> allMembers(n);
+    std::iota(allMembers.begin(), allMembers.end(), size_t(0));
+
+    mrpt::maps::CPointsMap::Ptr cloud =
+        buildSuperKeyframeCloud(allMembers, globals, seed.pose, params.merge_decimate_voxel);
+
+    auto [it, isNew] = out->keyframes_.try_emplace(
+        KeyFrameID{0}, creationOptions.k_correspondences_for_cov,
+        creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov);
+    KeyFrame& nkf = it->second;
+    nkf.timestamp = seed.timestamp;
+    nkf.pose(seed.pose);
+    nkf.pointcloud(cloud);
+    out->last_inserted_kf_id_ = 0;
+    out->next_free_kf_id_     = 1;
+
+    log("[regroup] unify_all: done, 1 super-keyframe produced.");
     return out;
   }
 
