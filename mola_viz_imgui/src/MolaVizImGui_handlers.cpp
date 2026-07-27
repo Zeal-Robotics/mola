@@ -115,7 +115,7 @@ void show_common_sensor_info(const mrpt::obs::CObservation& obs, const std::stri
   lastTimestamp[key] = curTim;
 
   const auto msg = mrpt::format(
-      "Sensor: %s | Rate: %.2f Hz | t=%s", obs.sensorLabel.c_str(), showHz,
+      "Sensor: %s | Rate: %7.02f Hz | t=%s", obs.sensorLabel.c_str(), showHz,
       mrpt::system::dateTimeToString(obs.timestamp).c_str());
 
   ImGui::Text("%s", msg.c_str());

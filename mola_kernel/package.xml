@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_kernel</name>
-  <version>2.9.0</version>
+  <version>3.0.0</version>
   <description>Fundamental C++ virtual interfaces and data types for the rest of MOLA modules</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -19,7 +19,6 @@
 
   <depend>mrpt_libobs</depend>
   <depend>mrpt_libmaps</depend>
-  <depend>mrpt_libgui</depend>
 
   <doc_depend>doxygen</doc_depend>
 

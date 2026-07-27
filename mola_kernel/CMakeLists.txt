@@ -18,14 +18,13 @@ find_package(mola_common REQUIRED)
 find_package(mola_yaml REQUIRED)
 
 # find dependencies:
-find_package(MRPT 2.15.0 REQUIRED COMPONENTS gui obs maps topography)
+find_package(MRPT 2.15.0 REQUIRED COMPONENTS obs maps topography)
 
 # define lib:
 set(LIB_SRCS
   src/interfaces/ExecutableBase.cpp
   src/interfaces/FilterBase.cpp
   src/interfaces/FrontEndBase.cpp
-  src/interfaces/KeyframeMapCapable.cpp
   src/interfaces/MetricChannel.cpp
   src/interfaces/NavStateFilter.cpp
   src/interfaces/RawDataSourceBase.cpp
@@ -55,7 +54,6 @@ set(LIB_PUBLIC_HDRS
   include/mola_kernel/interfaces/OfflineDatasetSource.h
   include/mola_kernel/interfaces/RawDataConsumer.h
   include/mola_kernel/interfaces/RawDataSourceBase.h
-  include/mola_kernel/interfaces/KeyframeMapCapable.h
   include/mola_kernel/interfaces/Relocalization.h
   include/mola_kernel/interfaces/SharedKeyframeMap.h
   include/mola_kernel/interfaces/VizInterface.h

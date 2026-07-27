@@ -210,8 +210,12 @@ MolaVizImGuiCore::PerWindowData& MolaVizImGui::create_and_add_window(const windo
 #endif
   glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
 
-  const std::string title = "MOLAViz ImGui - " + name;
-  GLFWwindow*       win   = glfwCreateWindow(1280, 800, title.c_str(), nullptr, nullptr);
+  std::string title = "MOLAViz ImGui - " + name;
+  if (core_ptr_->imgui_app_name_ != "default")
+  {
+    title += " [" + core_ptr_->imgui_app_name_ + "]";
+  }
+  GLFWwindow* win = glfwCreateWindow(1280, 800, title.c_str(), nullptr, nullptr);
   if (!win) throw std::runtime_error("MolaVizImGui: glfwCreateWindow failed");
 
   {
@@ -412,13 +416,19 @@ void MolaVizImGui::dataset_ui_check_new_modules()
     row.widgets.emplace_back(
         mola::gui::Label{std::make_shared<mola::gui::LiveString>("Playback rate:")});
 
-    row.widgets.emplace_back(mola::gui::ComboBox{
-        "", labels, selIdx,
-        [weakMod, rates](int idx)
-        {
-          if (auto m = weakMod.lock())
-            m->datasetUI_playback_speed(static_cast<double>(rates.at(idx)));
-        }});
+    {
+      mola::gui::ComboBox cb;
+      cb.label         = "";
+      cb.items         = labels;
+      cb.initial_index = selIdx;
+      cb.on_change     = [weakMod, rates](int idx)
+      {
+        if (auto m = weakMod.lock())
+          m->datasetUI_playback_speed(static_cast<double>(rates.at(idx)));
+      };
+      cb.fixed_width = 80;
+      row.widgets.emplace_back(std::move(cb));
+    }
 
     tab.widgets.emplace_back(std::move(row));
     desc.tabs.emplace_back(std::move(tab));
@@ -465,30 +475,71 @@ void MolaVizImGui::console_check_new_modules()
     module->setVerbosityLevelForCallbacks(captureLevel);
 
     const std::string name = module->getModuleInstanceName();
-    if (consoleHookedModules_.count(name)) continue;
-    consoleHookedModules_.insert(name);
-    sink->note_source(name);
+    if (!consoleHookedModules_.count(name))
+    {
+      consoleHookedModules_.insert(name);
+      sink->note_source(name);
 
-    // shared_ptr capture keeps the sink alive as long as the module's logger
-    // holds this callback; 'name' (not loggerName) is captured for a stable id.
-    module->logRegisterCallback(
-        [sink, name](
-            std::string_view msg, mrpt::system::VerbosityLevel       level,
-            std::string_view /*loggerName*/, mrpt::Clock::time_point timestamp)
-        {
-          std::vector<std::string> lines;
-          mrpt::system::tokenize(std::string(msg), "\r\n", lines);
-          if (lines.empty()) lines.push_back(std::string(msg));
-
-          for (const auto& line : lines)
+      // shared_ptr capture keeps the sink alive as long as the module's
+      // logger holds this callback; 'name' (not loggerName) is captured for
+      // a stable id.
+      module->logRegisterCallback(
+          [sink, name](
+              std::string_view msg, mrpt::system::VerbosityLevel       level,
+              std::string_view /*loggerName*/, mrpt::Clock::time_point timestamp)
           {
-            ConsoleLogEntry e;
-            e.timestamp = timestamp;
-            e.level     = level;
-            e.source    = name;
-            e.text      = line;
-            sink->push(e);
-          }
-        });
+            std::vector<std::string> lines;
+            mrpt::system::tokenize(std::string(msg), "\r\n", lines);
+            if (lines.empty()) lines.push_back(std::string(msg));
+
+            for (const auto& line : lines)
+            {
+              ConsoleLogEntry e;
+              e.timestamp = timestamp;
+              e.level     = level;
+              e.source    = name;
+              e.text      = line;
+              sink->push(e);
+            }
+          });
+    }
+
+    // Sub-loggers the module owns but does not log through itself (e.g. a
+    // library engine run on its own background thread). Hooked the same
+    // way, tagged with their own source name, so their output shows up in
+    // the console window without the module having to relay each message.
+    for (const auto& [childName, childLogger] : module->child_loggers())
+    {
+      if (!childLogger) continue;
+
+      // Re-applied every tick, same reasoning as for the module above.
+      childLogger->setVerbosityLevelForCallbacks(captureLevel);
+
+      if (consoleHookedChildLoggers_.count(childLogger)) continue;
+      consoleHookedChildLoggers_.insert(childLogger);
+
+      const std::string fullName = name + "/" + childName;
+      sink->note_source(fullName);
+
+      childLogger->logRegisterCallback(
+          [sink, fullName](
+              std::string_view msg, mrpt::system::VerbosityLevel       level,
+              std::string_view /*loggerName*/, mrpt::Clock::time_point timestamp)
+          {
+            std::vector<std::string> lines;
+            mrpt::system::tokenize(std::string(msg), "\r\n", lines);
+            if (lines.empty()) lines.push_back(std::string(msg));
+
+            for (const auto& line : lines)
+            {
+              ConsoleLogEntry e;
+              e.timestamp = timestamp;
+              e.level     = level;
+              e.source    = fullName;
+              e.text      = line;
+              sink->push(e);
+            }
+          });
+    }
   }
 }

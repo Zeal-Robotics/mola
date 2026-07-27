@@ -3,6 +3,9 @@ Changelog for package mola_relocalization
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 
+3.0.0 (2026-07-17)
+------------------
+
 2.9.0 (2026-05-11)
 ------------------
 * Merge pull request `#143 <https://github.com/MOLAorg/mola/issues/143>`_ from MOLAorg/bump-cmake-version
