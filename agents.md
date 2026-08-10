@@ -168,6 +168,17 @@ Tests: `mola_yaml/tests/test-yaml-parser.cpp`
   resurrect evicted geometry. The storage array itself never shrinks on its own:
   it settles at its high-water mark and slots are recycled; `compact()` releases
   it on demand.
+  `changeCoordinatesReference()` (all 3 overloads) is shadowed: a global SE(3)
+  re-map moves every coordinate, so it applies the transform and then rebuilds
+  the index over the *live* slot set (`rebuildIndexInPlace()`), dropping the
+  covariance cache. The base-class methods are **not virtual**, so a call
+  through a `mrpt::maps::CPointsMap*` cannot be intercepted; instead
+  `ensureIndexUpToDate()` compares a handful of sampled slot coordinates
+  (`coordinates_watch_`, refreshed by every internal mutator) against their
+  last known values and forces the same rebuild when they moved. Since the
+  sample is bounded, that guard covers a **global** re-map (all points move),
+  not a mutator rewriting a few points or a caller poking the inherited
+  coordinate buffers directly; those stay as stale-index hazards.
   Implements `mp2p_icp::NearestPointWithCovCapable` with lazily computed,
   cached, plane-regularized per-point covariances (the "option A" of the plan;
   voxel/NDT-style and dirty-propagation covariances remain future work). Not for
@@ -231,6 +242,15 @@ Tests: `mola_yaml/tests/test-yaml-parser.cpp`
   voxel-decimate step) is the most expensive part of `regroupKeyframes()` and is
   parallelized across clusters with TBB (`tbb::parallel_for`, gated by
   `MOLA_METRIC_MAPS_USE_TBB`, falling back to a serial loop when TBB is absent).
+- `KeyframePointCloudMap::TCreationOptions::max_distance_for_cov` bounds the per-point
+  covariance neighborhood, which maps onto nanoflann's radius-limited kNN (RKNN) via the
+  optional max-distance argument of MRPT's `kdTreeNClosestPoint3DIdx()`. That overload
+  throws at runtime on nanoflann < 1.5.1 (still the case on Ubuntu jammy / Humble), so
+  `computeCovariancesAndDensity()` guards it with `MOLA_MM_HAS_RKNN_SEARCH`
+  (`NANOFLANN_VERSION >= 0x151`) and otherwise runs a plain kNN truncated at the same
+  radius, which yields exactly the same neighbor set since results come back sorted.
+  The `NANOFLANN_VERSION` that decides is the one MRPT's own templates were built
+  against, picked up transitively from the MRPT headers: do not include nanoflann there.
 - `KeyframePointCloudMap::TCreationOptions::approximate_cov` (default `false`): for
   `nn_search_cov2cov()` (used by `mp2p_icp::Matcher_Cov2Cov`, i.e. GICP-style pipelines).
   When `true`, `icp_get_prepared_as_global()` skips assembling the merged, multi-keyframe
@@ -339,6 +359,25 @@ Test coverage exists for: `mola_yaml`, `mola_metric_maps`, `mola_pose_list`, `mo
 ### YAML Configuration
 All MOLA systems are described in YAML. See `mola_demos/` for examples.
 Variable expansion and file includes are supported by `mola_yaml`.
+
+### Exposing a /tf tree: `mola::TransformTreeSource`
+
+`mola_kernel/interfaces/TransformTreeSource.h` lets a module publish its tree
+of coordinate frames (ROS `/tf`) to other MOLA modules without dragging ROS
+types into `mola_kernel`: `transform_tree(root)` returns the subtree below
+`root` with poses already resolved against it, as plain `mrpt::poses::CPose3D`.
+
+- Implemented by `Rosbag1Dataset`, `Rosbag2Dataset` and `BridgeROS2`, all of
+  which already own a `tf2::BufferCore`. **The filtering is done in the
+  source**, since it is what owns the buffer: a consumer never receives, nor
+  walks, the frames of unrelated subtrees.
+- No locking is needed around the walk: `tf2::BufferCore` guards its own
+  internals, so it may run while another thread feeds `/tf`.
+- Consumers detect it with `findService<mola::TransformTreeSource>()`.
+- `TransformTree`/`TransformTreeNode` must stay **aggregates**: every producer
+  fills them with brace initialization, and since C++20 giving them any
+  constructor — even `= default` — makes that stop compiling. Lyrical builds
+  at C++20 and Humble/Jazzy at C++17, so this breaks on one distro only.
 
 ### GUI Widget Creation (v2.6+)
 Use `GuiWidgetDescription` for backend-agnostic widget creation in `VizInterface`.

@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_demos</name>
-  <version>3.0.0</version>
+  <version>3.1.0</version>
   <description>Demo and example launch files for MOLA</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -27,7 +27,6 @@
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_cmake_lint_cmake</test_depend>
   <test_depend>ament_cmake_pep257</test_depend>
-  <test_depend>ament_cmake_uncrustify</test_depend>
   <test_depend>ament_cmake_xmllint</test_depend>
 
   <export>
