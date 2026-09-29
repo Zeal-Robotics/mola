@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_input_lidar_bin_dataset</name>
-  <version>3.1.0</version>
+  <version>3.3.0</version>
   <description>Offline RawDataSource from LiDAR datasets stored as `.bin` files in the Kitti binary format</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -16,8 +16,12 @@
 
   <depend>mola_common</depend>
   <depend>mola_kernel</depend>
+  <depend>mola_yaml</depend>
 
-  <depend>mrpt_libmaps</depend>
+  <depend>mrpt_maps</depend>
+  <depend>mrpt_obs</depend>
+  <depend>mrpt_system</depend>
+  <depend>mrpt_core</depend>
 
   <doc_depend>doxygen</doc_depend>
 

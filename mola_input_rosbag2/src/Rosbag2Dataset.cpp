@@ -28,6 +28,7 @@
 #include <mola_yaml/yaml_helpers.h>
 #include <mrpt/containers/yaml.h>
 #include <mrpt/core/Clock.h>
+#include <mrpt/core/bits_math.h>
 #include <mrpt/core/initializer.h>
 #include <mrpt/obs/CActionRobotMovement3D.h>
 #include <mrpt/obs/CObservation2DRangeScan.h>
@@ -36,6 +37,7 @@
 #include <mrpt/obs/CObservationImage.h>
 #include <mrpt/obs/CObservationOdometry.h>
 #include <mrpt/obs/CObservationPointCloud.h>
+#include <mrpt/obs/CObservationRobotPose.h>
 #include <mrpt/obs/CObservationRotatingScan.h>
 #include <mrpt/ros2bridge/gps.h>
 #include <mrpt/ros2bridge/imu.h>
@@ -46,6 +48,7 @@
 #include <mrpt/system/filesystem.h>
 #include <mrpt/version.h>
 
+#include <chrono>
 #include <set>
 #include <tf2/buffer_core.hpp>
 #include <tf2/convert.hpp>
@@ -62,6 +65,8 @@
 #include <mrpt/ros2bridge/rosbag2_to_mrpt.h>
 #endif
 
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialization.hpp>
@@ -134,6 +139,8 @@ void Rosbag2Dataset::initialize_rds(const Yaml& c)
       {"sensor_msgs/msg/LaserScan", "CObservation2DRangeScan"},
       {"sensor_msgs/msg/NavSatFix", "CObservationGPS_NavSatFix"},
       {"gps_msgs/msg/GPSFix", "CObservationGPS_GpsFix"},
+      {"geometry_msgs/msg/PoseStamped", "CObservationRobotPose"},
+      {"geometry_msgs/msg/PoseWithCovarianceStamped", "CObservationRobotPose"},
   };
 
   MRPT_START
@@ -199,6 +206,10 @@ void Rosbag2Dataset::initialize_rds(const Yaml& c)
   rosbag_storage_ids_.clear();
   std::map<std::string, rosbag2_storage::TopicMetadata> all_topics_by_name;
 
+  // Time span covered by all input bags, to report the total dataset duration:
+  using bag_time_point = std::chrono::time_point<std::chrono::high_resolution_clock>;
+  std::optional<std::pair<bag_time_point, bag_time_point>> bagsTimeSpan;
+
   for (const auto& path : rosbag_filenames_)
   {
     const bool pathIsDir  = mrpt::system::directoryExists(path);
@@ -226,9 +237,26 @@ void Rosbag2Dataset::initialize_rds(const Yaml& c)
             inserted || it->second.type == t.type,
             "Topic '"s + t.name + "' has inconsistent types across input bags"s);
       }
-      const size_t cnt = static_cast<size_t>(tmpReader->get_metadata().message_count);
+      const auto&  md  = tmpReader->get_metadata();
+      const size_t cnt = static_cast<size_t>(md.message_count);
       per_bag_msg_counts_.push_back(cnt);
       bagMessageCount_ += cnt;
+
+      // Accumulate the total time span covered by all input bags:
+      if (cnt > 0)
+      {
+        const auto tIni = md.starting_time;
+        const auto tEnd = tIni + md.duration;
+        if (!bagsTimeSpan)
+        {
+          bagsTimeSpan = {tIni, tEnd};
+        }
+        else
+        {
+          bagsTimeSpan->first  = std::min(bagsTimeSpan->first, tIni);
+          bagsTimeSpan->second = std::max(bagsTimeSpan->second, tEnd);
+        }
+      }
       MRPT_LOG_INFO_STREAM(
           "Bag '" << path << "': " << cnt << " messages (storage: " << storageId << ")");
     }
@@ -238,6 +266,12 @@ void Rosbag2Dataset::initialize_rds(const Yaml& c)
   {
     MRPT_LOG_INFO_STREAM(
         "Total messages across " << rosbag_filenames_.size() << " bags: " << bagMessageCount_);
+  }
+
+  if (bagsTimeSpan)
+  {
+    dataset_total_time_ =
+        std::chrono::duration<double>(bagsTimeSpan->second - bagsTimeSpan->first).count();
   }
 
   // Open the first bag to read topic metadata and start replay.
@@ -322,26 +356,26 @@ void Rosbag2Dataset::initialize_rds(const Yaml& c)
 
   for (auto& sensorNode : sensorsYaml.asSequence())
   {
-    const auto& sensor = sensorNode.asMap();
-    const auto  topic  = sensor.at("topic").as<std::string>();
+    const mrpt::containers::yaml sensor(sensorNode);
+    const auto                   topic = sensor["topic"].as<std::string>();
 
     std::string sensorLabel = topic;
-    if (sensor.count("sensorLabel") != 0)
+    if (sensor.has("sensorLabel"))
     {
-      sensorLabel = sensor.at("sensorLabel").as<std::string>();
+      sensorLabel = sensor["sensorLabel"].as<std::string>();
     }
 
     // Map to MOLA class: auto or manual:
     std::string sensorType;
 
-    if (sensor.count("type") != 0)
+    if (sensor.has("type"))
     {
-      sensorType = sensor.at("type").as<std::string>();
+      sensorType = sensor["type"].as<std::string>();
     }
     else
     {
       bool topic_is_optional = false;
-      if (sensor.count("is_optional") != 0 && sensor.at("is_optional").as<bool>())
+      if (sensor.has("is_optional") && sensor["is_optional"].as<bool>())
       {
         topic_is_optional = true;
       }
@@ -377,11 +411,11 @@ void Rosbag2Dataset::initialize_rds(const Yaml& c)
 
     // Optional: fixed sensorPose (then ignores/don't need "tf" data):
     std::optional<mrpt::poses::CPose3D> fixedSensorPose;
-    if (sensor.count("fixed_sensor_pose") != 0 && (sensor.count("use_fixed_sensor_pose") == 0 ||
-                                                   sensor.at("use_fixed_sensor_pose").as<bool>()))
+    if (sensor.has("fixed_sensor_pose") &&
+        (!sensor.has("use_fixed_sensor_pose") || sensor["use_fixed_sensor_pose"].as<bool>()))
     {
       fixedSensorPose = mrpt::poses::CPose3D::FromString(
-          "["s + sensor.at("fixed_sensor_pose").as<std::string>() + "]"s);
+          "["s + sensor["fixed_sensor_pose"].as<std::string>() + "]"s);
     }
 
     // Optional: override this observation's timestamp with the bag's own
@@ -390,14 +424,14 @@ void Rosbag2Dataset::initialize_rds(const Yaml& c)
     // clock instead of wall-clock epoch time (seen in the wild for some IMU
     // drivers), which otherwise trips the "mis-timestamped sensors" time
     // reference reset (huge jump between this sensor and others).
-    const bool useBagRecvTimeAsTimestamp = sensor.count("use_bag_recv_time_as_timestamp") != 0 &&
-                                           sensor.at("use_bag_recv_time_as_timestamp").as<bool>();
+    const bool useBagRecvTimeAsTimestamp = sensor.has("use_bag_recv_time_as_timestamp") &&
+                                           sensor["use_bag_recv_time_as_timestamp"].as<bool>();
 
 #if 0  // TODO ?
 			else if (sensorType == "CObservation3DRangeScan")
 			{
-				bool rangeIsDepth = sensor.count("rangeIsDepth")
-										? sensor.at("rangeIsDepth").as<bool>()
+				bool rangeIsDepth = sensor.has("rangeIsDepth")
+										? sensor["rangeIsDepth"].as<bool>()
 										: true;
 				auto callback = [=](const sensor_msgs::Image::Ptr& image,
 									const sensor_msgs::CameraInfo::Ptr& info) {
@@ -546,6 +580,22 @@ void Rosbag2Dataset::initialize_rds(const Yaml& c)
       MRPT_LOG_INFO_STREAM("Installing callback for topic '" << topic << "'");
       lookup_[topic].emplace_back(callback);
     }
+
+    // Also a different signature: it needs the topic's ROS message type, since
+    // several of them map to this one MRPT class.
+    if (sensorType == "CObservationRobotPose")
+    {
+      const std::string rosMsgType = topic2type.count(topic) ? topic2type.at(topic) : std::string();
+      auto              callback   = [this, sensorLabel, fixedSensorPose,
+                       rosMsgType](const SerializedBagMessage& m) -> Obs
+      {
+        return catchExceptions(
+            [this, sensorLabel, m, rosMsgType, fixedSensorPose]()
+            { return toRobotPose(sensorLabel, m, rosMsgType, fixedSensorPose); });
+      };
+      MRPT_LOG_INFO_STREAM("Installing callback for topic '" << topic << "'");
+      lookup_[topic].emplace_back(callback);
+    }
 #else
     // To be removed:
     if (sensorType == "CObservationPointCloud")
@@ -590,6 +640,18 @@ void Rosbag2Dataset::initialize_rds(const Yaml& c)
     {
       auto callback = [=](const rosbag2_storage::SerializedBagMessage& m)
       { return catchExceptions([=]() { return toOdometry(sensorLabel, m); }); };
+      lookup_[topic].emplace_back(callback);
+    }
+    else if (sensorType == "CObservationRobotPose")
+    {
+      const std::string rosMsgType = topic2type.count(topic) ? topic2type.at(topic) : std::string();
+      auto              callback   = [this, sensorLabel, fixedSensorPose,
+                       rosMsgType](const rosbag2_storage::SerializedBagMessage& m)
+      {
+        return catchExceptions(
+            [this, sensorLabel, m, rosMsgType, fixedSensorPose]()
+            { return toRobotPose(sensorLabel, m, rosMsgType, fixedSensorPose); });
+      };
       lookup_[topic].emplace_back(callback);
     }
 #endif
@@ -785,6 +847,7 @@ void Rosbag2Dataset::spinOnce()
     auto lck = mrpt::lockHelper(dataset_ui_mtx_);
 
     last_used_tim_index_ = rosbag_next_idx_;
+    ui_dataset_time_     = last_dataset_time_;
   }
 
   MRPT_END
@@ -992,7 +1055,7 @@ std::optional<mola::TransformTree> Rosbag2Dataset::transform_tree(
   mola::TransformTree tree;
   tree.root      = root;
   tree.timestamp = timestamp.value_or(mrpt::Clock::now());
-  tree.nodes.push_back({root, {}, mrpt::poses::CPose3D::Identity()});
+  tree.nodes.push_back(mola::TransformTreeNode{root, {}, mrpt::poses::CPose3D::Identity()});
 
   // 'visited' guards against a cyclic parent chain: tf2 reassigns a frame's
   // parent on every setTransform(), so malformed input can produce one, and
@@ -1044,7 +1107,7 @@ std::optional<mola::TransformTree> Rosbag2Dataset::transform_tree(
         continue;
       }
 
-      tree.nodes.push_back({child, frame, childInRoot});
+      tree.nodes.push_back(mola::TransformTreeNode{child, frame, childInRoot});
       pending.push_back(child);
     }
   }
@@ -1332,6 +1395,73 @@ Rosbag2Dataset::Obs Rosbag2Dataset::toImage(
 }
 #endif
 
+namespace
+{
+/// A source that leaves `pose.covariance` all zeros is not claiming a perfect
+/// measurement, it is not filling the field in. Substitute something usable so
+/// downstream fusion does not read it as infinite confidence.
+void fillInDefaultPoseCovariance(mrpt::poses::CPose3DPDFGaussian& p)
+{
+  if (p.cov != mrpt::math::CMatrixDouble66::Zero()) return;
+
+  const double sigmaXYZ = 0.10;  // [m]
+  const double sigmaAng = mrpt::DEG2RAD(2.0);  // [rad]
+  for (int k = 0; k < 3; k++) p.cov(k, k) = mrpt::square(sigmaXYZ);
+  for (int k = 3; k < 6; k++) p.cov(k, k) = mrpt::square(sigmaAng);
+}
+}  // namespace
+
+Rosbag2Dataset::Obs Rosbag2Dataset::toRobotPose(
+    std::string_view label, const rosbag2_storage::SerializedBagMessage& rosmsg,
+    const std::string& rosMsgType, const std::optional<mrpt::poses::CPose3D>& fixedSensorPose)
+{
+  rclcpp::SerializedMessage serMsg(*rosmsg.serialized_data);
+
+  auto mrptObs         = mrpt::obs::CObservationRobotPose::Create();
+  mrptObs->sensorLabel = label;
+  // Unlike CObservationOdometry, this type can carry a sensor pose, so a
+  // source reported for a frame other than base_link remains usable here:
+  if (fixedSensorPose.has_value()) mrptObs->sensorPose = *fixedSensorPose;
+
+  if (rosMsgType == "nav_msgs/msg/Odometry")
+  {
+    static rclcpp::Serialization<nav_msgs::msg::Odometry> ser;
+    nav_msgs::msg::Odometry                               msg;
+    ser.deserialize_message(&serMsg, &msg);
+    mrptObs->timestamp = mrpt::ros2bridge::fromROS(msg.header.stamp);
+    mrptObs->pose      = mrpt::ros2bridge::fromROS(msg.pose);
+  }
+  else if (rosMsgType == "geometry_msgs/msg/PoseWithCovarianceStamped")
+  {
+    static rclcpp::Serialization<geometry_msgs::msg::PoseWithCovarianceStamped> ser;
+    geometry_msgs::msg::PoseWithCovarianceStamped                               msg;
+    ser.deserialize_message(&serMsg, &msg);
+    mrptObs->timestamp = mrpt::ros2bridge::fromROS(msg.header.stamp);
+    mrptObs->pose      = mrpt::ros2bridge::fromROS(msg.pose);
+  }
+  else if (rosMsgType == "geometry_msgs/msg/PoseStamped")
+  {
+    static rclcpp::Serialization<geometry_msgs::msg::PoseStamped> ser;
+    geometry_msgs::msg::PoseStamped                               msg;
+    ser.deserialize_message(&serMsg, &msg);
+    mrptObs->timestamp = mrpt::ros2bridge::fromROS(msg.header.stamp);
+    mrptObs->pose.mean = mrpt::ros2bridge::fromROS(msg.pose);
+    // geometry_msgs/PoseStamped carries no covariance at all.
+  }
+  else
+  {
+    THROW_EXCEPTION_FMT(
+        "Topic for sensorLabel '%s' was declared as 'CObservationRobotPose' but its ROS type is "
+        "'%s', which is none of nav_msgs/msg/Odometry, "
+        "geometry_msgs/msg/PoseWithCovarianceStamped or geometry_msgs/msg/PoseStamped.",
+        std::string(label).c_str(), rosMsgType.c_str());
+  }
+
+  fillInDefaultPoseCovariance(mrptObs->pose);
+
+  return {mrptObs};
+}
+
 Rosbag2Dataset::Obs Rosbag2Dataset::toCompressedImage(
     std::string_view label, const rosbag2_storage::SerializedBagMessage& rosmsg,
     const std::optional<mrpt::poses::CPose3D>& fixedSensorPose)
@@ -1349,9 +1479,13 @@ Rosbag2Dataset::Obs Rosbag2Dataset::toCompressedImage(
 
   auto cv_ptr = cv_bridge::toCvCopy(image, "bgr8");
 
-  // cv_ptr (and the cv::Mat it owns) is local to this call, so a shallow
-  // copy (ref-counted, no pixel buffer duplication) is safe here:
-  imgObs->image = mrpt::img::CImage(cv_ptr->image, mrpt::img::SHALLOW_COPY);
+  // MRPT 3.x's CImage no longer wraps cv::Mat directly (removed to drop the
+  // OpenCV dependency), so copy the decoded pixels via the raw-buffer loader
+  // instead; swapRedBlue=true converts cv_bridge's BGR order to MRPT's RGB.
+  ASSERT_(cv_ptr->image.isContinuous());
+  imgObs->image.loadFromMemoryBuffer(
+      cv_ptr->image.cols, cv_ptr->image.rows, mrpt::img::CH_RGB, cv_ptr->image.data,
+      /*swapRedBlue=*/true);
 
   if (fixedSensorPose)
   {

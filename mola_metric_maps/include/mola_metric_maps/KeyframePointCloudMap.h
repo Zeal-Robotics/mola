@@ -18,6 +18,7 @@
  */
 #pragma once
 
+#include <mola_metric_maps/MatchingDistanceProfileCompat.h>
 #include <mola_metric_maps/OptionsCapable.h>
 #include <mp2p_icp/IcpPrepareCapable.h>
 #include <mp2p_icp/MetricMapMergeCapable.h>
@@ -29,7 +30,7 @@
 #include <mrpt/maps/CSimplePointsMap.h>
 #include <mrpt/maps/NearestNeighborsCapable.h>
 #include <mrpt/math/TBoundingBox.h>
-#include <mrpt/opengl/opengl_frwds.h>
+#include <mrpt/viz/viz_frwds.h>
 
 #include <functional>
 #include <map>
@@ -227,6 +228,13 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
       const NearestPointWithCovCapable& localMap, const mrpt::poses::CPose3D& localMapPose,
       float max_search_distance, mp2p_icp::MatchedPointWithCovList& outPairings) const override;
 
+#if defined(MP2P_ICP_HAS_MATCHING_DISTANCE_PROFILE)
+  void nn_search_cov2cov(
+      const NearestPointWithCovCapable& localMap, const mrpt::poses::CPose3D& localMapPose,
+      const mp2p_icp::MatchingDistanceProfile& matchingDistance,
+      mp2p_icp::MatchedPointWithCovList&       outPairings) const override;
+#endif
+
   [[nodiscard]] std::size_t point_count() const override;
 
   /** @} */
@@ -237,7 +245,7 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
   /** Returns a short description of the map. */
   std::string asString() const override;
 
-  void getVisualizationInto(mrpt::opengl::CSetOfObjects& outObj) const override;
+  void getVisualizationInto(mrpt::viz::CSetOfObjects& outObj) const override;
 
   /** Returns true if the map is empty */
   bool isEmpty() const override;
@@ -250,7 +258,7 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
 
   /// Returns a cached point cloud view of the entire map.
   /// Not efficient at all. Only for MOLA->ROS2 bridge.
-  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const override;
+  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const;
 
   /** @} */
 
@@ -432,6 +440,45 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
      */
     double max_distance_for_cov = 1.0;
 
+    /** Maximum distance [meters] any neighbor may sit from the least-squares
+     *  plane through the whole neighborhood for that neighborhood to be given
+     *  the plane regularization below. 0 (default) disables the test, which is
+     *  the historical behavior: every neighborhood with enough neighbors is
+     *  regularized to a 1000:1 plane covariance whether or not it is planar.
+     *
+     *  This is Fast-LIO2's `esti_plane` gate. A neighborhood that fails it
+     *  falls back to an isotropic covariance, the same fallback the
+     *  too-few-neighbors case uses, so the pairing still constrains the
+     *  solution -- it just stops asserting a surface normal it cannot support.
+     *  The local density estimate is deliberately left untouched by a
+     *  rejection, so this knob moves the covariance and nothing else.
+     */
+    double max_plane_deviation_for_cov = 0;
+
+    /** The smallest of the three regularized singular values of a per-point
+     *  covariance, i.e. the variance asserted along the estimated surface
+     *  normal. The other two are 1, so this IS the plane confidence ratio:
+     *  the shipped 1e-3 asserts 1000:1.
+     *
+     *  Exposed because that ratio is not free. Information the whitening puts
+     *  into the normal direction it takes, relatively, from the two directions
+     *  in the surface, and on a ground vehicle the normal of the dominant
+     *  surface is the vertical -- the axis that is already best determined.
+     *  Raising this softens the assertion without changing which direction is
+     *  asserted.
+     *
+     *  Values in (0, 1] regularize as described above. A value <= 0 switches
+     *  the regularization off and keeps the eigenvalues the neighborhood
+     *  actually produced, so a sparse or rough neighborhood carries less
+     *  information than a dense flat one instead of the same amount; the
+     *  magnitude of the value is then a floor on the smaller eigenvalues,
+     *  relative to the largest one. Note that the two regimes are not on the
+     *  same scale, since kept eigenvalues carry squared metric units, so a
+     *  matching threshold or robust kernel tuned against one does not
+     *  transfer to the other.
+     */
+    double plane_regularization_lambda = 1e-3;
+
     /** Weight converting angular distance [rad] to equivalent linear
      *  distance [m] for keyframe proximity ranking. Higher values favor
      *  angularly-close (similar orientation) frames. */
@@ -564,10 +611,13 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
    public:
     KeyFrame(
         std::size_t k_correspondences_for_cov, std::size_t min_correspondences_for_cov,
-        double max_distance_for_cov)
+        double max_distance_for_cov, double max_plane_deviation_for_cov,
+        double plane_regularization_lambda)
         : k_correspondences_for_cov_(k_correspondences_for_cov),
           min_correspondences_for_cov_(min_correspondences_for_cov),
-          max_distance_for_cov_(max_distance_for_cov)
+          max_distance_for_cov_(max_distance_for_cov),
+          max_plane_deviation_for_cov_(max_plane_deviation_for_cov),
+          plane_regularization_lambda_(plane_regularization_lambda)
     {
     }
 
@@ -577,6 +627,8 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
           k_correspondences_for_cov_(other.k_correspondences_for_cov_),
           min_correspondences_for_cov_(other.min_correspondences_for_cov_),
           max_distance_for_cov_(other.max_distance_for_cov_),
+          max_plane_deviation_for_cov_(other.max_plane_deviation_for_cov_),
+          plane_regularization_lambda_(other.plane_regularization_lambda_),
           pointcloud_(other.pointcloud_),
           pose_(other.pose_)
     {
@@ -592,6 +644,8 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
         k_correspondences_for_cov_   = other.k_correspondences_for_cov_;
         min_correspondences_for_cov_ = other.min_correspondences_for_cov_;
         max_distance_for_cov_        = other.max_distance_for_cov_;
+        max_plane_deviation_for_cov_ = other.max_plane_deviation_for_cov_;
+        plane_regularization_lambda_ = other.plane_regularization_lambda_;
         pointcloud_                  = other.pointcloud_;
         pose_                        = other.pose_;
         timestamp                    = other.timestamp;
@@ -659,11 +713,14 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
      */
     void updateCovarianceParams(
         std::size_t k_correspondences_for_cov, std::size_t min_correspondences_for_cov,
-        double max_distance_for_cov)
+        double max_distance_for_cov, double max_plane_deviation_for_cov,
+        double plane_regularization_lambda)
     {
       k_correspondences_for_cov_   = k_correspondences_for_cov;
       min_correspondences_for_cov_ = min_correspondences_for_cov;
       max_distance_for_cov_        = max_distance_for_cov;
+      max_plane_deviation_for_cov_ = max_plane_deviation_for_cov;
+      plane_regularization_lambda_ = plane_regularization_lambda;
       invalidateCache();
     }
 
@@ -707,17 +764,19 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
      * normal per-field colormap, and the result is NOT cached (used by the per-keyframe
      * debug coloring, see `MOLA_KEYFRAME_MAP_VIZ_COLOR_BY_KF`).
      */
-    std::shared_ptr<mrpt::opengl::CPointCloudColoured> getViz(
+    std::shared_ptr<mrpt::viz::CPointCloudColoured> getViz(
         const TRenderOptions&                   ro,
         const std::optional<mrpt::img::TColor>& overrideColor = std::nullopt) const;
 
-    std::shared_ptr<mrpt::opengl::CSetOfObjects> getCovarianceEllipsoidViz(
+    std::shared_ptr<mrpt::viz::CSetOfObjects> getCovarianceEllipsoidViz(
         const TRenderOptions& ro) const;
 
    private:
     std::size_t k_correspondences_for_cov_;
     std::size_t min_correspondences_for_cov_;
     double      max_distance_for_cov_;
+    double      max_plane_deviation_for_cov_;
+    double      plane_regularization_lambda_;
 
     void updateBBox() const;
     void computeCovariancesAndDensity() const;
@@ -745,10 +804,10 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
     mutable mrpt::maps::CPointsMap::Ptr pointcloud_global_;
 
     /** Cached visualization, created/getted by getViz() */
-    mutable std::shared_ptr<mrpt::opengl::CPointCloudColoured> cached_viz_;
+    mutable std::shared_ptr<mrpt::viz::CPointCloudColoured> cached_viz_;
 
     /** Cached cov visualization, created/getted by getCovarianceEllipsoidViz() */
-    mutable std::shared_ptr<mrpt::opengl::CSetOfObjects> cachez_viz_covs_;
+    mutable std::shared_ptr<mrpt::viz::CSetOfObjects> cachez_viz_covs_;
   };
 
   std::map<KeyFrameID, KeyFrame> keyframes_;
@@ -845,7 +904,15 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
    *  \sa TCreationOptions::approximate_cov
    */
   void nn_search_cov2cov_approximate(
-      const KeyFrame& localKf, const std::set<KeyFrameID>& activeKfs, float max_search_distance,
+      const KeyFrame& localKf, const std::set<KeyFrameID>& activeKfs,
+      const MatchingDistanceProfile&     matchingDistance,
+      mp2p_icp::MatchedPointWithCovList& outPairings) const;
+
+  /** The actual cov2cov search. Both public overloads forward here, so the
+   *  implementation stays free of preprocessor branches. */
+  void nn_search_cov2cov_impl(
+      const NearestPointWithCovCapable& localMap, const mrpt::poses::CPose3D& localMapPose,
+      const MatchingDistanceProfile&     matchingDistance,
       mp2p_icp::MatchedPointWithCovList& outPairings) const;
 };
 

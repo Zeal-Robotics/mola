@@ -23,6 +23,8 @@ Sphinx==7.2.6
 sphinxcontrib-applehelp==1.0.8
 sphinxcontrib-bibtex==2.6.2
 sphinxcontrib-mermaid==0.9.2
+sphinx-sitemap==2.6.0
+sphinxext-opengraph==0.9.1
 sphinxcontrib-devhelp==1.0.6
 sphinxcontrib-htmlhelp==2.0.5
 sphinxcontrib-jquery==4.1
@@ -30,4 +32,6 @@ sphinxcontrib-jsmath==1.0.1
 sphinxcontrib-qthelp==1.0.7
 sphinxcontrib-serializinghtml==1.1.10
 urllib3==2.6.3
-setuptools
+# pkg_resources, which sphinxcontrib-bibtex still imports, was removed in
+# setuptools 82. Leave this unpinned and a fresh environment breaks the build.
+setuptools<82

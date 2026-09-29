@@ -356,6 +356,44 @@ class NDT : public mrpt::maps::CMetricMap,
    *  @{ */
   NearestPlaneResult nn_search_pt2pl(
       const mrpt::math::TPoint3Df& point, const float max_search_distance) const override;
+
+#if defined(MP2P_ICP_HAS_NN_VISIT_PT2PL_CANDIDATES)
+  void nn_visit_pt2pl_candidates(
+      const mrpt::math::TPoint3Df& point, float max_search_distance,
+      const plane_candidate_visitor_t& visitor) const override;
+#endif
+
+  /** Visits every existing voxel that a nearest-plane query at `point` has to
+   *  examine. Shared by the two searches above so that they always walk the
+   *  same voxels, in the same order.
+   */
+  template <typename Functor>
+  void visitPt2PlSearchCells(
+      const mrpt::math::TPoint3Df& point, const float max_search_distance, Functor f) const
+  {
+    const int margin = static_cast<int>(std::ceil(max_search_distance * voxel_size_inv_));
+
+    const global_index3d_t idxs0 =
+        coordToGlobalIdx(point) - global_index3d_t(margin, margin, margin);
+    const global_index3d_t idxs1 =
+        coordToGlobalIdx(point) + global_index3d_t(margin, margin, margin);
+
+    for (int32_t cx = idxs0.cx; cx <= idxs1.cx; cx++)
+    {
+      for (int32_t cy = idxs0.cy; cy <= idxs1.cy; cy++)
+      {
+        for (int32_t cz = idxs0.cz; cz <= idxs1.cz; cz++)
+        {
+          const VoxelData* v = voxelByGlobalIdxs({cx, cy, cz});
+          if (!v)
+          {
+            continue;
+          }
+          f(*v);
+        }
+      }
+    }
+  }
   /** @} */
 
   /** @name Public virtual methods implementation for CMetricMap
@@ -364,7 +402,7 @@ class NDT : public mrpt::maps::CMetricMap,
   /** Returns a short description of the map. */
   std::string asString() const override;
 
-  void getVisualizationInto(mrpt::opengl::CSetOfObjects& outObj) const override;
+  void getVisualizationInto(mrpt::viz::CSetOfObjects& outObj) const override;
 
   /** Returns true if the map is empty */
   bool isEmpty() const override;
@@ -377,7 +415,7 @@ class NDT : public mrpt::maps::CMetricMap,
 
   /// Returns a cached point cloud view of the hash map.
   /// Not efficient at all. Only for MOLA->ROS2 bridge.
-  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const override;
+  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const;
 
   /** @} */
 

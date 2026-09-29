@@ -368,16 +368,20 @@ void deepMergeNode(yaml::node_t& base, const yaml::node_t& overlay)
 {
   if (base.isMap() && overlay.isMap())
   {
-    auto& baseMap = base.asMap();
+    // `yaml::map_t` is a vector-backed, insertion-order structure (not
+    // associative), so lookups go through the `yaml_ref` wrapper's has()/
+    // operator[] rather than through asMap() directly.
+    mrpt::containers::yaml_ref baseRef(base);
     for (const auto& [key, value] : overlay.asMap())
     {
-      if (auto it = baseMap.find(key); it != baseMap.end())
+      const auto keyStr = key.as<std::string>();
+      if (baseRef.has(keyStr))
       {
-        deepMergeNode(it->second, value);
+        deepMergeNode(baseRef[keyStr].node(), value);
       }
       else
       {
-        baseMap[key] = value;
+        baseRef[keyStr] = yaml(value);
       }
     }
   }
@@ -401,8 +405,12 @@ void deepMergeNode(yaml::node_t& base, const yaml::node_t& overlay)
 [[nodiscard]] yaml::node_t loadExternalYaml(
     const std::string& pathExpr, const mola::YAMLParseOptions& opts)
 {
-  // Resolve any variable/command expressions inside the path itself.
-  std::string expr = trimWSNL(mola::parse_yaml(pathExpr, opts));
+  // Resolve any variable/command expressions inside the path itself. Variables
+  // in the PATH are always expanded, even with `doEnvVars` disabled: that flag
+  // is about the loaded contents, and an unexpanded path can never be loaded.
+  auto pathOpts      = opts;
+  pathOpts.doEnvVars = true;
+  std::string expr   = trimWSNL(mola::parse_yaml(pathExpr, pathOpts));
 
   // Resolve relative paths against the current include base.
   if (!opts.includesBasePath.empty())
@@ -485,11 +493,14 @@ void processMapDirectives(yaml::node_t& n, const mola::YAMLParseOptions& opts)
   // OVERRIDE particular entries (nested maps merge deeply; scalars/sequences
   // replace). This is what lets `params:` reference a shared file and then
   // tweak just a few keys, instead of duplicating the whole block.
-  // NOTE: parens-init (NOT braces): `node_t{std::string}` would bind to the
-  // initializer_list<node_t> constructor and build a 1-element SEQUENCE node
-  // instead of a scalar, which then throws in operator<'s internalAsStr().
-  const yaml::node_t importKey(std::string("$import"));
-  if (const auto itImport = m.find(importKey); itImport != m.end())
+  // `yaml::map_t` is a vector-backed, insertion-order structure (not
+  // associative), so lookups use std::find_if over key names rather than
+  // `map_t::find()`, which does not exist.
+  const auto itImport = std::find_if(
+      m.begin(), m.end(),
+      [](const auto& kv)
+      { return kv.first.isScalar() && kv.first.template as<std::string>() == "$import"; });
+  if (itImport != m.end())
   {
     std::vector<std::string> importPaths;
     const auto&              importVal = itImport->second;
@@ -526,8 +537,9 @@ void processMapDirectives(yaml::node_t& n, const mola::YAMLParseOptions& opts)
         continue;
       }
       recursiveProcessIncludes(value, opts);
-      yaml::node_t single = yaml::Map();
-      single.asMap()[key] = value;
+      yaml::node_t               single = yaml::Map();
+      mrpt::containers::yaml_ref singleRef(single);
+      singleRef[key.as<std::string>()] = yaml(value);
       deepMergeNode(merged, single);
     }
 
@@ -566,8 +578,12 @@ void processMapDirectives(yaml::node_t& n, const mola::YAMLParseOptions& opts)
 [[nodiscard]] std::optional<mola::YAMLParseOptions> consumeDefineBlock(
     yaml::map_t& m, const mola::YAMLParseOptions& opts)
 {
-  const yaml::node_t defineKey(std::string("$define"));
-  const auto         itDefine = m.find(defineKey);
+  // `yaml::map_t` is a vector-backed, insertion-order structure (not
+  // associative), so lookups use std::find_if over key names.
+  const auto itDefine = std::find_if(
+      m.begin(), m.end(),
+      [](const auto& kv)
+      { return kv.first.isScalar() && kv.first.template as<std::string>() == "$define"; });
   if (itDefine == m.end())
   {
     return std::nullopt;
@@ -612,6 +628,10 @@ void recursiveProcessIncludes(yaml::node_t& n, const mola::YAMLParseOptions& opt
 {
   if (n.isScalar())
   {
+    // A null scalar (e.g. an empty YAML value, or an explicit `~`/`null`)
+    // has no string representation to search for "$include{" in.
+    if (n.isNullNode()) return;
+
     const std::string text = n.as<std::string>();
 
     const auto tokenStart = text.find("$include{");

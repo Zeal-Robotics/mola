@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_input_video</name>
-  <version>3.1.0</version>
+  <version>3.3.0</version>
   <description>RawDataSource from live or offline video sources</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -15,8 +15,8 @@
 
   <depend>mola_kernel</depend>
 
-  <depend>mrpt_libobs</depend>
-  <depend>mrpt_libhwdrivers</depend>
+  <depend>mrpt_obs</depend>
+  <depend>mrpt_hwdrivers</depend>
 
   <doc_depend>doxygen</doc_depend>
 

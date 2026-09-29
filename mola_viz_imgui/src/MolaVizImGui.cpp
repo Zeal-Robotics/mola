@@ -33,7 +33,12 @@
 #include <mrpt/system/string_utils.h>
 #include <mrpt/system/thread_name.h>
 
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace mola;
@@ -44,8 +49,11 @@ IMPLEMENTS_MRPT_OBJECT(MolaVizImGui, ExecutableBase, mola)
 // Static constant definitions
 // ---------------------------------------------------------------------------
 
+// NOTE: initialized from the compile-time literal, NOT copied from
+// MolaVizImGuiCore::DEFAULT_WINDOW_NAME: that object lives in another
+// translation unit and the initialization order between them is unspecified.
 const MolaVizImGui::window_name_t MolaVizImGui::DEFAULT_WINDOW_NAME =
-    MolaVizImGuiCore::DEFAULT_WINDOW_NAME;
+    MolaVizImGuiCore::DEFAULT_WINDOW_NAME_LITERAL;
 
 // ---------------------------------------------------------------------------
 // MRPT initializer
@@ -289,9 +297,22 @@ void MolaVizImGui::gui_thread()
 
   const double frame_period = 1.0 / static_cast<double>(std::max(1, core_ptr_->target_fps_));
 
+  // Elapsed time between consecutive frame starts: what the user perceives
+  // as GUI (un)responsiveness. Reported by the profiler (mola-cli -p).
+  // Measured with a steady clock, since mrpt::Clock may follow simulated time.
+  std::optional<std::chrono::steady_clock::time_point> last_frame_start;
+
   while (!guiThreadShutdown_.load())
   {
-    const double t0 = mrpt::Clock::nowDouble();
+    const double t0          = mrpt::Clock::nowDouble();
+    const auto   frame_start = std::chrono::steady_clock::now();
+    if (last_frame_start && profiler_.isEnabled())
+    {
+      profiler_.registerUserMeasure(
+          "gui_thread.frame_interval",
+          std::chrono::duration<double>(frame_start - *last_frame_start).count());
+    }
+    last_frame_start = frame_start;
 
     glfwPollEvents();
 
@@ -300,10 +321,16 @@ void MolaVizImGui::gui_thread()
       if (wd.glfw_window && !glfwWindowShouldClose(wd.glfw_window)) any_open = true;
     if (!any_open) break;
 
-    for (auto& [name, wd] : core_ptr_->windows_)
     {
-      if (!wd.glfw_window || glfwWindowShouldClose(wd.glfw_window)) continue;
-      core_ptr_->render_frame(name, wd);
+      const ProfilerEntry tle(profiler_, "gui_thread.render_frame");
+      for (auto& [name, wd] : core_ptr_->windows_)
+      {
+        if (!wd.glfw_window || glfwWindowShouldClose(wd.glfw_window))
+        {
+          continue;
+        }
+        core_ptr_->render_frame(name, wd);
+      }
     }
 
     const double elapsed = mrpt::Clock::nowDouble() - t0;
@@ -346,6 +373,29 @@ void MolaVizImGui::gui_thread()
 // Dataset UI
 // ---------------------------------------------------------------------------
 
+namespace
+{
+/** Compact "[h:]mm:ss.s" rendering of a time interval, for the dataset
+ *  playback panel. */
+std::string format_playback_time(double t)
+{
+  if (t < 0 || !std::isfinite(t))
+  {
+    t = 0;
+  }
+  const auto   totalSecs = static_cast<uint64_t>(t);
+  const auto   hours     = static_cast<unsigned int>(totalSecs / 3600);
+  const auto   mins      = static_cast<unsigned int>((totalSecs / 60) % 60);
+  const double secs      = t - static_cast<double>(hours * 3600 + mins * 60);
+
+  if (hours > 0)
+  {
+    return mrpt::format("%u:%02u:%04.1f", hours, mins, secs);
+  }
+  return mrpt::format("%u:%04.1f", mins, secs);
+}
+}  // namespace
+
 void MolaVizImGui::dataset_ui_check_new_modules()
 {
   auto datasetUIs = findService<Dataset_UI>();
@@ -353,6 +403,12 @@ void MolaVizImGui::dataset_ui_check_new_modules()
   {
     const auto modUI = std::dynamic_pointer_cast<Dataset_UI>(module);
     ASSERT_(modUI);
+
+    // Not an offline dataset (yet): check again on the next call.
+    if (!modUI->datasetUI_enabled())
+    {
+      continue;
+    }
 
     auto& e = datasetUIs_[module->getModuleInstanceName()];
     if (!e.first_time_seen) continue;
@@ -383,7 +439,7 @@ void MolaVizImGui::dataset_ui_check_new_modules()
     mola::gui::WindowDescription desc;
     desc.title               = module->getModuleInstanceName();
     desc.position            = {300, 5};
-    desc.size                = {650, 70};
+    desc.size                = {800, 70};
     desc.dock_top_by_default = true;
 
     mola::gui::Tab tab{"Controls", {}};
@@ -446,7 +502,19 @@ void MolaVizImGui::dataset_ui_update()
     if (!mod || !e.lbPlaybackPosition) continue;
     const size_t pos = mod->datasetUI_lastQueriedTimestep();
     const size_t N   = mod->datasetUI_size();
-    e.lbPlaybackPosition->set(mrpt::format("%zu / %zu", pos, N));
+
+    std::string txt = mrpt::format("%zu / %zu", pos, N);
+
+    // Dataset playback time, if the source can tell it. The total duration
+    // may be unknown even if the current time is known:
+    if (const auto t = mod->datasetUI_time(); t.has_value())
+    {
+      const auto T = mod->datasetUI_total_time();
+      txt += "  |  " + format_playback_time(*t) + " / " +
+             (T.has_value() ? format_playback_time(*T) : std::string("???"));
+    }
+
+    e.lbPlaybackPosition->set(txt);
     if (e.liveSliderPos) e.liveSliderPos->set(static_cast<float>(pos));
   }
 }

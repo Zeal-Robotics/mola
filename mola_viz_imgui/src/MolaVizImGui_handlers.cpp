@@ -32,10 +32,13 @@
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/obs/CObservationRotatingScan.h>
 #include <mrpt/obs/CObservationVelodyneScan.h>
-#include <mrpt/opengl/COpenGLScene.h>
-#include <mrpt/opengl/CPointCloudColoured.h>
-#include <mrpt/opengl/stock_objects.h>
+#include <mrpt/obs/customizable_obs_viz.h>
+#include <mrpt/viz/CPointCloudColoured.h>
+#include <mrpt/viz/Scene.h>
+#include <mrpt/viz/stock_objects.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <set>
 
@@ -121,8 +124,7 @@ void show_common_sensor_info(const mrpt::obs::CObservation& obs, const std::stri
   ImGui::Text("%s", msg.c_str());
   // too verbose? ImGui::Text("Class: %s", , obs.GetRuntimeClass()->className);
 
-  mrpt::poses::CPose3D sensorPose;
-  obs.getSensorPose(sensorPose);
+  const auto sensorPose = obs.getSensorPose();
   ImGui::Text("Sensor pose: %s", sensorPose.asString().c_str());
 }
 
@@ -193,7 +195,7 @@ void handler_images(
 
   if (!st.initialized)
   {
-    auto scene = mrpt::opengl::COpenGLScene::Create();
+    auto scene = mrpt::viz::Scene::Create();
     st.sceneView.setScene(scene);
     st.initialized = true;
   }
@@ -208,7 +210,7 @@ void handler_images(
 
     const auto imgW = static_cast<int>(imgToShow.getWidth());
     const auto imgH = static_cast<int>(imgToShow.getHeight());
-    ImGui::Text("Size: %dx%dx%d", imgW, imgH, imgToShow.channelCount());
+    ImGui::Text("Size: %dx%dx%d", imgW, imgH, static_cast<int>(imgToShow.channels()));
 
     // Drain stale GL errors before MRPT rendering:
     drain_gl_errors();
@@ -224,12 +226,66 @@ void handler_images(
 
 struct PointCloudViewState
 {
-  mrpt::imgui::CImGuiSceneView           sceneView;
-  mrpt::opengl::CPointCloudColoured::Ptr glPc;
-  mrpt::opengl::CSetOfObjects::Ptr       glCornerRef;
-  mrpt::opengl::CSetOfObjects::Ptr       glCornerSensor;
-  bool                                   initialized = false;
+  mrpt::imgui::CImGuiSceneView        sceneView;
+  mrpt::viz::CPointCloudColoured::Ptr glPc;
+  mrpt::viz::CSetOfObjects::Ptr       glCornerRef;
+  mrpt::viz::CSetOfObjects::Ptr       glCornerSensor;
+  bool                                initialized = false;
+
+  // What glPc was last built from, to rebuild it only when it changes:
+  mrpt::rtti::CObject::Ptr lastObs;
+  bool                     lastColorFromZ = true;
+  bool                     populated      = false;
+
+  // Point fields the user can color by, and the selected one (point clouds only):
+  std::vector<std::string> colorFields;
+  std::string              colorField;
+  std::string              lastColorField;
 };
+
+// Point fields offered for coloring; RGB channel triplets are merged into a single
+// "rgb"/"rgbf" entry, the names mrpt::obs::recolorize3Dpc() understands.
+std::vector<std::string> color_fields_of(const mrpt::maps::CPointsMap& pc)
+{
+  std::set<std::string> fields;
+  for (const auto& names :
+       {pc.getPointFieldNames_float(), pc.getPointFieldNames_double(),
+        pc.getPointFieldNames_uint16(), pc.getPointFieldNames_uint8(),
+        pc.getPointFieldNames_uint32()})
+  {
+    fields.insert(names.begin(), names.end());
+  }
+
+  for (const auto& [merged, r, g, b] :
+       {std::array<const char*, 4>{"rgb", "color_r", "color_g", "color_b"},
+        std::array<const char*, 4>{"rgbf", "color_rf", "color_gf", "color_bf"}})
+  {
+    if (fields.count(r) && fields.count(g) && fields.count(b))
+    {
+      fields.erase(r);
+      fields.erase(g);
+      fields.erase(b);
+      fields.insert(merged);
+    }
+  }
+  return {fields.begin(), fields.end()};
+}
+
+// Initial coloring: height, unless the YAML asks for the cloud's own colors.
+std::string default_color_field(const std::vector<std::string>& fields, bool color_from_z)
+{
+  if (!color_from_z)
+  {
+    for (const char* f : {"rgb", "rgbf"})
+    {
+      if (std::find(fields.begin(), fields.end(), f) != fields.end())
+      {
+        return f;
+      }
+    }
+  }
+  return "z";
+}
 
 void handler_point_cloud(
     const mrpt::rtti::CObject::Ptr& o, void* /*handle*/,
@@ -282,19 +338,19 @@ void handler_point_cloud(
 
   if (!st.initialized)
   {
-    auto scene        = mrpt::opengl::COpenGLScene::Create();
-    st.glPc           = mrpt::opengl::CPointCloudColoured::Create();
-    st.glCornerRef    = mrpt::opengl::stock_objects::CornerXYZ(1.0f);
-    st.glCornerSensor = mrpt::opengl::stock_objects::CornerXYZ(0.5f);
+    auto scene        = mrpt::viz::Scene::Create();
+    st.glPc           = mrpt::viz::CPointCloudColoured::Create();
+    st.glCornerRef    = mrpt::viz::stock_objects::CornerXYZ(1.0f);
+    st.glCornerSensor = mrpt::viz::stock_objects::CornerXYZ(0.5f);
     st.glPc->setPointSize(3.0f);
     scene->insert(st.glPc);
     scene->insert(st.glCornerRef);
     scene->insert(st.glCornerSensor);
     st.sceneView.setScene(scene);
     st.sceneView.setBackgroundColor(0.15f, 0.15f, 0.18f);
-    st.sceneView.camera().setZoomDistance(20.0f);
-    st.sceneView.camera().setAzimuthDegrees(-140.0f);
-    st.sceneView.camera().setElevationDegrees(30.0f);
+    st.sceneView.cameraController.setZoomDistance(20.0f);
+    st.sceneView.cameraController.setAzimuthDegrees(-140.0f);
+    st.sceneView.cameraController.setElevationDegrees(30.0f);
     st.initialized = true;
   }
 
@@ -307,107 +363,157 @@ void handler_point_cloud(
     color_from_z = extra->getOrDefault("color_from_z", color_from_z);
   }
   st.glPc->setPointSize(point_size);
-  st.glPc->setPose(mrpt::poses::CPose3D::Identity());
-  st.glPc->clear();
 
-  // Set sensor pose on corner marker:
+  // Rebuilding the cloud is O(points) and forces a new GPU upload, so it is
+  // done once per new observation, not on every GUI frame.
+  if (o != st.lastObs || color_from_z != st.lastColorFromZ || st.colorField != st.lastColorField)
   {
-    mrpt::poses::CPose3D p;
-    obs->getSensorPose(p);
-    st.glCornerSensor->setPose(p);
-  }
+    st.lastObs        = o;
+    st.lastColorFromZ = color_from_z;
 
-  // Populate point cloud from observation:
-  bool populated = false;
+    st.glPc->setPose(mrpt::poses::CPose3D::Identity());
+    st.glPc->clear();
 
-  if (auto objPc = std::dynamic_pointer_cast<CObservationPointCloud>(o); objPc)
-  {
-    objPc->load();
-    if (objPc->pointcloud)
+    // Set sensor pose on corner marker:
+    st.glCornerSensor->setPose(obs->getSensorPose());
+
+    // Populate point cloud from observation:
+    bool& populated = st.populated;
+    populated       = false;
+
+    if (auto objPc = std::dynamic_pointer_cast<CObservationPointCloud>(o); objPc)
     {
-      st.glPc->loadFromPointsMap(objPc->pointcloud.get());
-      st.glPc->setPose(objPc->sensorPose);
-      populated = true;
-    }
-  }
-  else if (auto objRS = std::dynamic_pointer_cast<CObservationRotatingScan>(o); objRS)
-  {
-    objRS->load();
-    mrpt::math::TBoundingBoxf bbox = mrpt::math::TBoundingBoxf::PlusMinusInfinity();
-    for (size_t r = 0; r < objRS->rowCount; r++)
-    {
-      for (size_t c = 0; c < objRS->columnCount; c++)
+      objPc->load();
+      if (objPc->pointcloud)
       {
-        if (objRS->rangeImage(r, c) == 0) continue;
-        const auto& pt = objRS->organizedPoints(r, c);
-        st.glPc->insertPoint({pt.x, pt.y, pt.z, 0, 0, 0});
-        bbox.updateWithPoint(pt);
-      }
-    }
-    st.glPc->recolorizeByCoordinate(bbox.min.z, bbox.max.z);
-    color_from_z = false;
-    populated    = true;
-  }
-  else if (auto obj3D = std::dynamic_pointer_cast<CObservation3DRangeScan>(o); obj3D)
-  {
-    if (instance->show_rgbd_as_point_cloud_)
-    {
-      obj3D->load();
-      if (obj3D->hasPoints3D)
-      {
-        for (size_t i = 0; i < obj3D->points3D_x.size(); i++)
-          st.glPc->insertPoint(
-              {obj3D->points3D_x[i], obj3D->points3D_y[i], obj3D->points3D_z[i], 0, 0, 0});
-      }
-      else if (obj3D->hasRangeImage && obj3D->hasIntensityImage)
-      {
-        mrpt::obs::T3DPointsProjectionParams pp;
-        pp.takeIntoAccountSensorPoseOnRobot = true;
-        auto pointMapCol                    = mrpt::maps::CGenericPointsMap::Create();
-        pointMapCol->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Ru8);
-        pointMapCol->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Gu8);
-        pointMapCol->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Bu8);
-        obj3D->unprojectInto(*pointMapCol, pp);
-        st.glPc->loadFromPointsMap(pointMapCol.get());
+        const auto* pc = objPc->pointcloud.get();
+        st.glPc->loadFromPointsMap(pc);
+        st.glPc->setPose(objPc->sensorPose);
+
+        st.colorFields = color_fields_of(*pc);
+        if (std::find(st.colorFields.begin(), st.colorFields.end(), st.colorField) ==
+            st.colorFields.end())
+        {
+          st.colorField = default_color_field(st.colorFields, color_from_z);
+        }
+        st.lastColorField = st.colorField;
+
+        mrpt::obs::PointCloudRecoloringParameters rp;
+        rp.colorizeByField = st.colorField;
+        // Trim the tails, so a few outliers (e.g. retro-reflectors) do not wash out the scale:
+        rp.outlierRejectionPercentile = 0.01f;
+        mrpt::obs::recolorize3Dpc(st.glPc, pc, rp);
+
         color_from_z = false;
+        populated    = true;
       }
-      else if (obj3D->hasRangeImage)
-      {
-        mrpt::obs::T3DPointsProjectionParams pp;
-        pp.takeIntoAccountSensorPoseOnRobot = true;
-        obj3D->unprojectInto(*st.glPc, pp);
-      }
-      populated = true;
     }
-  }
-  else if (auto obj2D = std::dynamic_pointer_cast<CObservation2DRangeScan>(o); obj2D)
-  {
-    mrpt::maps::CSimplePointsMap auxMap;
-    auxMap.insertObservationPtr(std::make_shared<CObservation2DRangeScan>(*obj2D));
-    st.glPc->loadFromPointsMap(&auxMap);
-    populated = true;
-  }
-  else if (auto objVel = std::dynamic_pointer_cast<CObservationVelodyneScan>(o); objVel)
-  {
-    if (objVel->point_cloud.size() > 0)
+    else if (auto objRS = std::dynamic_pointer_cast<CObservationRotatingScan>(o); objRS)
     {
-      const auto&  pc = objVel->point_cloud;
-      const size_t N  = pc.size();
-      for (size_t i = 0; i < N; i++) st.glPc->insertPoint({pc.x[i], pc.y[i], pc.z[i], 0, 0, 0});
+      objRS->load();
+      mrpt::math::TBoundingBoxf bbox = mrpt::math::TBoundingBoxf::PlusMinusInfinity();
+      for (size_t r = 0; r < objRS->rowCount; r++)
+      {
+        for (size_t c = 0; c < objRS->columnCount; c++)
+        {
+          if (objRS->rangeImage(r, c) == 0)
+          {
+            continue;
+          }
+          const auto& pt = objRS->organizedPoints(r, c);
+          st.glPc->insertPoint({pt.x, pt.y, pt.z, 0, 0, 0});
+          bbox.updateWithPoint(pt);
+        }
+      }
+      st.glPc->recolorizeByCoordinate(bbox.min.z, bbox.max.z);
+      color_from_z = false;
+      populated    = true;
+    }
+    else if (auto obj3D = std::dynamic_pointer_cast<CObservation3DRangeScan>(o); obj3D)
+    {
+      if (instance->show_rgbd_as_point_cloud_)
+      {
+        obj3D->load();
+        if (obj3D->hasPoints3D)
+        {
+          for (size_t i = 0; i < obj3D->points3D_x.size(); i++)
+          {
+            st.glPc->insertPoint(
+                {obj3D->points3D_x[i], obj3D->points3D_y[i], obj3D->points3D_z[i], 0, 0, 0});
+          }
+        }
+        else if (obj3D->hasRangeImage && obj3D->hasIntensityImage)
+        {
+          mrpt::obs::T3DPointsProjectionParams pp;
+          pp.takeIntoAccountSensorPoseOnRobot = true;
+          auto pointMapCol                    = mrpt::maps::CGenericPointsMap::Create();
+          pointMapCol->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Ru8);
+          pointMapCol->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Gu8);
+          pointMapCol->registerField_uint8(mrpt::maps::CPointsMap::POINT_FIELD_COLOR_Bu8);
+          obj3D->unprojectInto(*pointMapCol, pp);
+          st.glPc->loadFromPointsMap(pointMapCol.get());
+          color_from_z = false;
+        }
+        else if (obj3D->hasRangeImage)
+        {
+          mrpt::obs::T3DPointsProjectionParams pp;
+          pp.takeIntoAccountSensorPoseOnRobot = true;
+          obj3D->unprojectInto(*st.glPc, pp);
+        }
+        populated = true;
+      }
+    }
+    else if (auto obj2D = std::dynamic_pointer_cast<CObservation2DRangeScan>(o); obj2D)
+    {
+      mrpt::maps::CSimplePointsMap auxMap;
+      auxMap.insertObservationPtr(std::make_shared<CObservation2DRangeScan>(*obj2D));
+      st.glPc->loadFromPointsMap(&auxMap);
       populated = true;
+    }
+    else if (auto objVel = std::dynamic_pointer_cast<CObservationVelodyneScan>(o); objVel)
+    {
+      if (objVel->point_cloud.size() > 0)
+      {
+        const auto&  pc = objVel->point_cloud;
+        const size_t N  = pc.size();
+        for (size_t i = 0; i < N; i++)
+        {
+          st.glPc->insertPoint({pc.x[i], pc.y[i], pc.z[i], 0, 0, 0});
+        }
+        populated = true;
+      }
+    }
+
+    if (populated && color_from_z)
+    {
+      const auto bb = st.glPc->getBoundingBox();
+      st.glPc->recolorizeByCoordinate(static_cast<float>(bb.min.z), static_cast<float>(bb.max.z));
     }
   }
 
-  if (!populated) return;
-
-  if (color_from_z)
+  if (!st.populated)
   {
-    const auto bb = st.glPc->getBoundingBox();
-    st.glPc->recolorizeByCoordinate(static_cast<float>(bb.min.z), static_cast<float>(bb.max.z));
+    return;
   }
 
   if (ImGui::Begin(winId.c_str()))
   {
+    if (!st.colorFields.empty())
+    {
+      ImGui::SetNextItemWidth(140);
+      if (ImGui::BeginCombo("Color by", st.colorField.c_str()))
+      {
+        for (const auto& f : st.colorFields)
+        {
+          if (ImGui::Selectable(f.c_str(), f == st.colorField))
+          {
+            st.colorField = f;  // the cloud is recolored on the next frame
+          }
+        }
+        ImGui::EndCombo();
+      }
+    }
+
     show_common_sensor_info(*obs, winId);
 
     if (auto objPc = std::dynamic_pointer_cast<CObservationPointCloud>(o);

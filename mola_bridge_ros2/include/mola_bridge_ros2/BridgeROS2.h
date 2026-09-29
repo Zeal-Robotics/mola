@@ -37,11 +37,6 @@
 #include <mrpt/obs/CObservationPointCloud.h>
 
 // ROS & others
-#include <tf2_ros/buffer.hpp>
-#include <tf2_ros/static_transform_broadcaster.hpp>
-#include <tf2_ros/transform_broadcaster.hpp>
-#include <tf2_ros/transform_listener.hpp>
-
 #include <atomic>
 #include <nav_msgs/msg/odometry.hpp>
 #include <optional>
@@ -51,6 +46,10 @@
 #include <sensor_msgs/msg/laser_scan.hpp>
 #include <sensor_msgs/msg/nav_sat_fix.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/static_transform_broadcaster.hpp>
+#include <tf2_ros/transform_broadcaster.hpp>
+#include <tf2_ros/transform_listener.hpp>
 
 #if defined(HAS_GPS_MSGS)
 #include <gps_msgs/msg/gps_fix.hpp>
@@ -468,6 +467,23 @@ class BridgeROS2 : public RawDataSourceBase,
 
   double lastTimeCheckMolaSubs_ = 0;
   void   doLookForNewMolaSubs();
+
+  /// Timestamp of the last module scan triggered on demand (see
+  /// relocalizationModules()). Atomic: unlike lastTimeCheckMolaSubs_, which
+  /// only the spinOnce() thread touches, this one is written from ROS
+  /// callback threads.
+  std::atomic<double> lastOnDemandMolaSubsScan_{0};
+
+  /// Returns a copy of the set of MOLA modules implementing mola::Relocalization.
+  /// `discoverIfEmpty` runs one module scan when none is known yet, so that a
+  /// request arriving before the periodic scan (see period_check_new_mola_subs)
+  /// is not dropped.
+  [[nodiscard]] std::set<std::shared_ptr<mola::Relocalization>> relocalizationModules(
+      bool discoverIfEmpty);
+
+  /// Returns the MapServer module ROS 2 service requests are forwarded to, or
+  /// an empty pointer if none is running.
+  [[nodiscard]] std::shared_ptr<mola::MapServer> firstMapServer();
 
   void internalOn(const mrpt::obs::CObservationImage& obs);
   void internalOn(const mrpt::obs::CObservation2DRangeScan& obs);

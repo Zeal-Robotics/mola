@@ -32,12 +32,13 @@
 #include <mrpt/obs/CObservation3DRangeScan.h>
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/obs/CObservationVelodyneScan.h>
-#include <mrpt/opengl/CPointCloud.h>
-#include <mrpt/opengl/CPointCloudColoured.h>
-#include <mrpt/opengl/CSetOfLines.h>
-#include <mrpt/opengl/CSetOfTriangles.h>
 #include <mrpt/serialization/CArchive.h>  // serialization
 #include <mrpt/system/os.h>
+#include <mrpt/viz/CPointCloud.h>
+#include <mrpt/viz/CPointCloudColoured.h>
+#include <mrpt/viz/CSetOfLines.h>
+#include <mrpt/viz/CSetOfObjects.h>
+#include <mrpt/viz/CSetOfTriangles.h>
 
 #include <cmath>
 
@@ -207,7 +208,7 @@ std::string NDT::asString() const
       "NDT, resolution=%.03f bbox=%s", voxel_size_, boundingBox().asString().c_str());
 }
 
-void NDT::getVisualizationInto(mrpt::opengl::CSetOfObjects& outObj) const
+void NDT::getVisualizationInto(mrpt::viz::CSetOfObjects& outObj) const
 {
   MRPT_START
   if (!genericMapParams.enableSaveAs3DObject)
@@ -282,7 +283,7 @@ void NDT::getVisualizationInto(mrpt::opengl::CSetOfObjects& outObj) const
   // points:
   if (renderOptions.points_visible)
   {
-    auto obj = mrpt::opengl::CPointCloudColoured::Create();
+    auto obj = mrpt::viz::CPointCloudColoured::Create();
 
     const auto lambdaVisitPoints = [&obj](const mrpt::math::TPoint3Df& pt) {
       obj->insertPoint({pt.x, pt.y, pt.z, 0, 0, 0});
@@ -321,7 +322,7 @@ void NDT::getVisualizationInto(mrpt::opengl::CSetOfObjects& outObj) const
   // planes:
   if (renderOptions.planes_visible)
   {
-    auto obj = mrpt::opengl::CSetOfTriangles::Create();
+    auto obj = mrpt::viz::CSetOfTriangles::Create();
 
     const auto lambdaVisitVoxel =
         [&obj, recolorK, recolorMin, recolorIdx, this](
@@ -348,7 +349,7 @@ void NDT::getVisualizationInto(mrpt::opengl::CSetOfObjects& outObj) const
       const auto  vx = ndt->eigVectors.at(1).cast<float>() * s;
       const auto  vy = ndt->eigVectors.at(2).cast<float>() * s;
 
-      mrpt::opengl::TTriangle t;
+      mrpt::viz::TTriangle t;
 
       if (renderOptions.planes_colormap == mrpt::img::cmNONE)
       {
@@ -380,7 +381,7 @@ void NDT::getVisualizationInto(mrpt::opengl::CSetOfObjects& outObj) const
   // normals:
   if (renderOptions.normals_visible)
   {
-    auto obj = mrpt::opengl::CSetOfLines::Create();
+    auto obj = mrpt::viz::CSetOfLines::Create();
 
     const auto lambdaVisitVoxel =
         [&obj, this]([[maybe_unused]] const global_index3d_t& idx, const VoxelData& v)
@@ -1165,62 +1166,75 @@ mp2p_icp::NearestPlaneCapable::NearestPlaneResult NDT::nn_search_pt2pl(
 {
   NearestPlaneCapable::NearestPlaneResult ret;
 
-  const int nn_search_margin = static_cast<int>(std::ceil(max_search_distance * voxel_size_inv_));
-
-  const global_index3d_t idxs0 =
-      coordToGlobalIdx(query) -
-      global_index3d_t(nn_search_margin, nn_search_margin, nn_search_margin);
-  const global_index3d_t idxs1 =
-      coordToGlobalIdx(query) +
-      global_index3d_t(nn_search_margin, nn_search_margin, nn_search_margin);
-
-  auto lambdaCheckCell = [&](const global_index3d_t& p)
-  {
-    auto* v = voxelByGlobalIdxs(p);
-    if (!v)
-    {
-      return;
-    }
-    const auto& ndt = v->ndt();
-    if (!ndt)
-    {
-      return;
-    }
-    if (!ndt_is_plane(*ndt))
-    {
-      return;
-    }
-
-    const auto&                normal        = ndt->eigVectors[0];
-    const mrpt::math::TPoint3D planeCentroid = ndt->meanCov.mean.asTPoint();
-    const auto                 thePlane      = mrpt::math::TPlane(planeCentroid, normal);
-    const double               ptPlaneDist   = std::abs(thePlane.distance(query));
-
-    // Better than the current one? replace:
-    if (!ret.pairing || ptPlaneDist < ret.distance)
-    {
-      auto& pa              = ret.pairing.emplace();
-      pa.pt_local           = query;
-      pa.pl_global.centroid = planeCentroid;
-      pa.pl_global.plane    = thePlane;
-
-      ret.distance = static_cast<float>(ptPlaneDist);
-    }
-  };
-
-  for (int32_t cx = idxs0.cx; cx <= idxs1.cx; cx++)
-  {
-    for (int32_t cy = idxs0.cy; cy <= idxs1.cy; cy++)
-    {
-      for (int32_t cz = idxs0.cz; cz <= idxs1.cz; cz++)
+  visitPt2PlSearchCells(
+      query, max_search_distance,
+      [&](const VoxelData& v)
       {
-        lambdaCheckCell({cx, cy, cz});
-      }
-    }
-  }
+        const auto& ndt = v.ndt();
+        if (!ndt)
+        {
+          return;
+        }
+        if (!ndt_is_plane(*ndt))
+        {
+          return;
+        }
+
+        const auto&                normal        = ndt->eigVectors[0];
+        const mrpt::math::TPoint3D planeCentroid = ndt->meanCov.mean.asTPoint();
+        const auto                 thePlane      = mrpt::math::TPlane(planeCentroid, normal);
+        const double               ptPlaneDist   = std::abs(thePlane.distance(query));
+
+        // Better than the current one? replace:
+        if (!ret.pairing || ptPlaneDist < ret.distance)
+        {
+          auto& pa              = ret.pairing.emplace();
+          pa.pt_local           = query;
+          pa.pl_global.centroid = planeCentroid;
+          pa.pl_global.plane    = thePlane;
+
+          ret.distance = static_cast<float>(ptPlaneDist);
+        }
+      });
 
   return ret;
 }
+
+#if defined(MP2P_ICP_HAS_NN_VISIT_PT2PL_CANDIDATES)
+void NDT::nn_visit_pt2pl_candidates(
+    const mrpt::math::TPoint3Df& query, const float max_search_distance,
+    const plane_candidate_visitor_t& visitor) const
+{
+  visitPt2PlSearchCells(
+      query, max_search_distance,
+      [&](const VoxelData& v)
+      {
+        const auto& ndt = v.ndt();
+        if (!ndt)
+        {
+          return;
+        }
+        if (!ndt_is_plane(*ndt))
+        {
+          return;
+        }
+
+        const auto&                normal        = ndt->eigVectors[0];
+        const mrpt::math::TPoint3D planeCentroid = ndt->meanCov.mean.asTPoint();
+        const auto                 thePlane      = mrpt::math::TPlane(planeCentroid, normal);
+
+        PlaneCandidate c;
+        c.pairing.pt_local           = query;
+        c.pairing.pl_global.centroid = planeCentroid;
+        c.pairing.pl_global.plane    = thePlane;
+        c.distance                   = static_cast<float>(std::abs(thePlane.distance(query)));
+        c.centroidDistance =
+            static_cast<float>((planeCentroid - mrpt::math::TPoint3D(query)).norm());
+
+        visitor(c);
+      });
+}
+#endif
 
 bool NDT::nn_single_search(
     const mrpt::math::TPoint3Df& query, mrpt::math::TPoint3Df& result, float& out_dist_sqr,

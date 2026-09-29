@@ -18,6 +18,9 @@
  */
 
 #include <mola_metric_maps/KeyframePointCloudMap.h>
+
+#include "cov_diagnostics.h"
+#include "covariance_shape.h"
 #if __has_include(<mp2p_icp/pointcloud_field_utils.h>)
 #include <mp2p_icp/pointcloud_field_utils.h>
 #define MOLA_MM_HAS_ROTATE_VIEW_HEADER 1
@@ -30,22 +33,26 @@
 #include <mrpt/math/matrix_serialization.h>  // CArchive << CMatrixFloat33 (cov baking)
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/obs/customizable_obs_viz.h>
-#include <mrpt/opengl/CEllipsoid3D.h>
-#include <mrpt/opengl/CPointCloudColoured.h>
-#include <mrpt/opengl/Scene.h>
-#include <mrpt/opengl/stock_objects.h>
 #include <mrpt/poses/Lie/SO.h>
 #include <mrpt/serialization/CArchive.h>  // serialization
 #include <mrpt/serialization/optional_serialization.h>
 #include <mrpt/serialization/stl_serialization.h>
 #include <mrpt/system/string_utils.h>  // unitsFormat()
 #include <mrpt/version.h>  // For MRPT_VERSION
+#include <mrpt/viz/CEllipsoid3D.h>
+#include <mrpt/viz/CPointCloudColoured.h>
+#include <mrpt/viz/Scene.h>
+#include <mrpt/viz/stock_objects.h>
 
+#include <Eigen/Eigenvalues>  // SelfAdjointEigenSolver (optional cov diagnostic)
 #include <algorithm>  // std::lower_bound
 #include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <iterator>  // std::distance
+#include <memory>
 #include <numeric>  // std::accumulate
+#include <ostream>
 #include <sstream>
 #include <unordered_set>
 
@@ -180,12 +187,12 @@ const thread_local auto ENV_DEBUG_ACTIVE_KFS =
 // #define DO_VIZ_DEBUG 1
 
 #if DO_VIZ_DEBUG
-#include <mrpt/opengl/CAxis.h>
-#include <mrpt/opengl/CEllipsoid3D.h>
-#include <mrpt/opengl/CGridPlaneXY.h>
-#include <mrpt/opengl/CPointCloud.h>
-#include <mrpt/opengl/CSetOfLines.h>
-#include <mrpt/opengl/Scene.h>
+#include <mrpt/viz/CAxis.h>
+#include <mrpt/viz/CEllipsoid3D.h>
+#include <mrpt/viz/CGridPlaneXY.h>
+#include <mrpt/viz/CPointCloud.h>
+#include <mrpt/viz/CSetOfLines.h>
+#include <mrpt/viz/Scene.h>
 
 #include <fstream>
 #endif
@@ -363,7 +370,9 @@ void KeyframePointCloudMap::serializeFrom(mrpt::serialization::CArchive& in, uin
 
         auto [it, isNew] = keyframes_.try_emplace(
             kf_id, creationOptions.k_correspondences_for_cov,
-            creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov);
+            creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov,
+            creationOptions.max_plane_deviation_for_cov,
+            creationOptions.plane_regularization_lambda);
         KeyFrame& kf = it->second;
 
         in >> kf.timestamp;
@@ -815,7 +824,8 @@ void KeyframePointCloudMap::icp_get_prepared_as_global(  // NOLINT
   cached_.icp_search_submap.reset();
   cached_.icp_search_submap.emplace(
       creationOptions.k_correspondences_for_cov, creationOptions.min_correspondences_for_cov,
-      creationOptions.max_distance_for_cov);
+      creationOptions.max_distance_for_cov, creationOptions.max_plane_deviation_for_cov,
+      creationOptions.plane_regularization_lambda);
 
   for (const auto kf_id : kfs_to_search_limited)
   {
@@ -925,7 +935,8 @@ void KeyframePointCloudMap::merge_with(
     }
     auto [it, isNew] = keyframes_.try_emplace(
         next_free_kf_id_++, creationOptions.k_correspondences_for_cov,
-        creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov);
+        creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov,
+        creationOptions.max_plane_deviation_for_cov, creationOptions.plane_regularization_lambda);
     auto& new_kf = it->second;
 
     // copy
@@ -960,6 +971,25 @@ void KeyframePointCloudMap::nn_search_cov2cov(
     const NearestPointWithCovCapable& localMap, const mrpt::poses::CPose3D& localMapPose,
     const float max_search_distance, mp2p_icp::MatchedPointWithCovList& outPairings) const
 {
+  nn_search_cov2cov_impl(
+      localMap, localMapPose, MatchingDistanceProfile(max_search_distance), outPairings);
+}
+
+#if defined(MP2P_ICP_HAS_MATCHING_DISTANCE_PROFILE)
+void KeyframePointCloudMap::nn_search_cov2cov(
+    const NearestPointWithCovCapable& localMap, const mrpt::poses::CPose3D& localMapPose,
+    const mp2p_icp::MatchingDistanceProfile& matchingDistance,
+    mp2p_icp::MatchedPointWithCovList&       outPairings) const
+{
+  nn_search_cov2cov_impl(localMap, localMapPose, matchingDistance, outPairings);
+}
+#endif
+
+void KeyframePointCloudMap::nn_search_cov2cov_impl(
+    const NearestPointWithCovCapable& localMap, const mrpt::poses::CPose3D& localMapPose,
+    const MatchingDistanceProfile&     matchingDistance,
+    mp2p_icp::MatchedPointWithCovList& outPairings) const
+{
   auto lck = mrpt::lockHelper(*state_mtx_);
 
   // Enforce local map to recompute its covariances to the new pose:
@@ -977,8 +1007,7 @@ void KeyframePointCloudMap::nn_search_cov2cov(
     ASSERTMSG_(
         cached_.icp_search_kfs,
         "Using this method requires calling icp_get_prepared_as_global() first");
-    nn_search_cov2cov_approximate(
-        localKf, *cached_.icp_search_kfs, max_search_distance, outPairings);
+    nn_search_cov2cov_approximate(localKf, *cached_.icp_search_kfs, matchingDistance, outPairings);
     localKf.pose(originalLocalKfPose);
     return;
   }
@@ -996,7 +1025,12 @@ void KeyframePointCloudMap::nn_search_cov2cov(
 
   const auto localPointCount = localPointsTransf->size();
 
-  const float max_sqr_dist = mrpt::square(max_search_distance);
+  // Fast path: a flat threshold (the common case, and the only one before this
+  // profile existed) needs no per-point range computation.
+  const bool  matchDistIsFlat  = matchingDistance.isFlat();
+  const float matchDistFlatSqr = mrpt::square(matchingDistance.near);
+
+  const bool needsQueryRange = matchingDistance.needsRange();
 
   const auto& xs_tf = localPointsTransf->getPointsBufferRef_x();
   const auto& ys_tf = localPointsTransf->getPointsBufferRef_y();
@@ -1090,10 +1124,11 @@ void KeyframePointCloudMap::nn_search_cov2cov(
       do_view_filter ? static_cast<float>(std::cos(mrpt::DEG2RAD(max_view_angle_deg)))
                      : -2.0f;  // sentinel: never reached when filter is disabled
 
-#if defined(MOLA_METRIC_MAPS_USE_TBB)
-  // Pairings are appended, so only the ones added below get reordered:
+  // Pairings are appended, so only the ones added below get reordered, and the
+  // optional diagnostic below reads only that range.
   const size_t firstNewPairing = outPairings.size();
 
+#if defined(MOLA_METRIC_MAPS_USE_TBB)
   tbb::enumerable_thread_specific<mp2p_icp::MatchedPointWithCovList> tls;
 
   tbb::parallel_for(
@@ -1103,9 +1138,22 @@ void KeyframePointCloudMap::nn_search_cov2cov(
   for (size_t local_idx = 0; local_idx < localPointCount; local_idx++)
 #endif
       {
-        float nn_dist_sqr = std::numeric_limits<float>::max();
+        // Range from the sensor, i.e. in the query's own (untransformed) local frame -
+        // matches how the range-adaptive threshold was measured and validated (see
+        // ~/plans/icp-bench-range-adaptive-matching.md).
+        float range = 0;
+        if (needsQueryRange)
+        {
+          range = std::sqrt(
+              mrpt::square(xs[local_idx]) + mrpt::square(ys[local_idx]) +
+              mrpt::square(zs[local_idx]));
+        }
 
-        const auto nn_global_idx = globalPoints->kdTreeClosestPoint3D(
+        const float max_sqr_dist =
+            matchDistIsFlat ? matchDistFlatSqr : mrpt::square(matchingDistance(range));
+
+        float        nn_dist_sqr   = std::numeric_limits<float>::max();
+        const size_t nn_global_idx = globalPoints->kdTreeClosestPoint3D(
             xs_tf[local_idx], ys_tf[local_idx], zs_tf[local_idx], nn_dist_sqr);
 
         if (nn_dist_sqr > max_sqr_dist)
@@ -1184,6 +1232,18 @@ void KeyframePointCloudMap::nn_search_cov2cov(
       { return a.local_idx < b.local_idx; });
 #endif
 
+  // Optional diagnostic, computed serially on the finished pairing list so the
+  // parallel loop above is untouched:
+  if (auto* ds = mola::cov_diag::stream(); ds)
+  {
+    mola::cov_diag::dump(
+        *ds, "kf", outPairings, firstNewPairing,
+        [&](const mp2p_icp::point_with_cov_pair_t& p) -> const mrpt::math::CMatrixFloat33&
+        { return localKfCov.at(p.local_idx); },
+        [&](const mp2p_icp::point_with_cov_pair_t& p) -> const mrpt::math::CMatrixFloat33&
+        { return globalKfCov.at(p.global_idx); });
+  }
+
   // Recover original:
   localKf.pose(originalLocalKfPose);
 }
@@ -1205,15 +1265,20 @@ uint32_t packApproxGlobalIdx(uint32_t kf_ordinal, uint32_t local_idx)
 }  // namespace
 
 void KeyframePointCloudMap::nn_search_cov2cov_approximate(
-    const KeyFrame& localKf, const std::set<KeyFrameID>& activeKfs, const float max_search_distance,
+    const KeyFrame& localKf, const std::set<KeyFrameID>& activeKfs,
+    const MatchingDistanceProfile&     matchingDistance,
     mp2p_icp::MatchedPointWithCovList& outPairings) const
 {
   const auto& localKfCov        = localKf.covariancesGlobal();
   const auto& localPointsTransf = localKf.pointcloud_global();
   const auto& localPoints       = localKf.pointcloud();
 
-  const auto  localPointCount = localPointsTransf->size();
-  const float max_sqr_dist    = mrpt::square(max_search_distance);
+  const auto localPointCount = localPointsTransf->size();
+
+  // See the exact-mode nn_search_cov2cov() above for the rationale.
+  const bool  matchDistIsFlat  = matchingDistance.isFlat();
+  const float matchDistFlatSqr = mrpt::square(matchingDistance.near);
+  const bool  needsQueryRange  = matchingDistance.needsRange();
 
   const auto& xs_tf = localPointsTransf->getPointsBufferRef_x();
   const auto& ys_tf = localPointsTransf->getPointsBufferRef_y();
@@ -1324,11 +1389,35 @@ void KeyframePointCloudMap::nn_search_cov2cov_approximate(
   for (size_t local_idx = 0; local_idx < localPointCount; local_idx++)
 #endif
       {
+        float range = 0;
+        if (needsQueryRange)
+        {
+          range = std::sqrt(
+              mrpt::square(xs[local_idx]) + mrpt::square(ys[local_idx]) +
+              mrpt::square(zs[local_idx]));
+        }
+
+        const float max_sqr_dist =
+            matchDistIsFlat ? matchDistFlatSqr : mrpt::square(matchingDistance(range));
+
         // "N" KD-tree queries (one per active KF) instead of one on a merged cloud:
         float  best_dist_sqr = std::numeric_limits<float>::max();
         size_t best_entry    = 0;
         size_t best_idx      = 0;
         bool   found         = false;
+
+        // The winner may live in a different keyframe than the previous best, so
+        // candidates are folded across all of them.
+        const auto lambdaFoldCandidate = [&](size_t e, size_t idx, float d)
+        {
+          if (d < best_dist_sqr)
+          {
+            best_dist_sqr = d;
+            best_entry    = e;
+            best_idx      = idx;
+            found         = true;
+          }
+        };
 
         for (size_t e = 0; e < entries.size(); e++)
         {
@@ -1337,16 +1426,11 @@ void KeyframePointCloudMap::nn_search_cov2cov_approximate(
           // distances, so best_dist_sqr remains comparable across keyframes.
           const auto ql = entries[e].poseInv.composePoint(
               mrpt::math::TPoint3D(xs_tf[local_idx], ys_tf[local_idx], zs_tf[local_idx]));
+
           float      d   = std::numeric_limits<float>::max();
           const auto idx = entries[e].localPoints->kdTreeClosestPoint3D(
               static_cast<float>(ql.x), static_cast<float>(ql.y), static_cast<float>(ql.z), d);
-          if (d < best_dist_sqr)
-          {
-            best_dist_sqr = d;
-            best_entry    = e;
-            best_idx      = idx;
-            found         = true;
-          }
+          lambdaFoldCandidate(e, idx, d);
         }
 
         if (!found || best_dist_sqr > max_sqr_dist)
@@ -1452,9 +1536,10 @@ void KeyframePointCloudMap::nn_search_cov2cov_approximate(
     printf(
         "[KeyframePointCloudMap] nn_search_cov2cov_approximate: query_points=%zu "
         "active_kfs=%zu accepted=%zu no_candidate_in_range=%zu rejected_by_view_filter=%zu "
-        "max_search_distance=%.3f\n",
+        "matching_distance_near=%.3f matching_distance_far=%.3f\n",
         localPointCount, entries.size(), statsAccepted.load(), statsNoCandidateInRange.load(),
-        statsRejectedByViewFilter.load(), static_cast<double>(max_search_distance));
+        statsRejectedByViewFilter.load(), static_cast<double>(matchingDistance.near),
+        static_cast<double>(matchingDistance.far));
   }
 }
 
@@ -1509,7 +1594,7 @@ mrpt::img::TColor distinctKfColor(size_t i)
 }
 }  // namespace
 
-void KeyframePointCloudMap::getVisualizationInto(mrpt::opengl::CSetOfObjects& outObj) const
+void KeyframePointCloudMap::getVisualizationInto(mrpt::viz::CSetOfObjects& outObj) const
 {
   MRPT_START
   if (!genericMapParams.enableSaveAs3DObject)
@@ -1565,7 +1650,7 @@ void KeyframePointCloudMap::getVisualizationInto(mrpt::opengl::CSetOfObjects& ou
     {
       const float axesLength =
           (ENV_KEYFRAMES_SHOW_ACTIVE_FRAMES && isActiveKF ? 3.0f : 1.0f) * nominalAxesLength;
-      auto glAxes = mrpt::opengl::stock_objects::CornerXYZSimple(axesLength);
+      auto glAxes = mrpt::viz::stock_objects::CornerXYZSimple(axesLength);
       glAxes->setPose(kf.pose());
       outObj.insert(glAxes);
     }
@@ -1602,14 +1687,14 @@ bool KeyframePointCloudMap::trySetCreationOptions(
   // already-built internal structures (each keyframe's own KD-tree, point clouds, etc.), so it
   // is always safe to apply them in place, regardless of whether the map already holds data.
   //
-  // Caveat: k_correspondences_for_cov/min_correspondences_for_cov/max_distance_for_cov are
-  // copied into each KeyFrame at construction time (used to lazily compute per-point
-  // covariances), instead of being read live from `creationOptions`. Propagate the new values
-  // to all existing keyframes and invalidate their cached covariances, so they get recomputed
-  // with the new parameters next time they are queried.
-  // Note on approximate_cov: icp_get_prepared_as_global() compares
-  // cached_.icp_search_built_approximate against the live option, so a change here (even
-  // with an unchanged active KF set) is picked up and forces a rebuild on the next call.
+  // Caveat: k_correspondences_for_cov/min_correspondences_for_cov/max_distance_for_cov/
+  // max_plane_deviation_for_cov are copied into each KeyFrame at construction time (used to lazily
+  // compute per-point covariances), instead of being read live from `creationOptions`. Propagate
+  // the new values to all existing keyframes and invalidate their cached covariances, so they get
+  // recomputed with the new parameters next time they are queried. Note on approximate_cov:
+  // icp_get_prepared_as_global() compares cached_.icp_search_built_approximate against the live
+  // option, so a change here (even with an unchanged active KF set) is picked up and forces a
+  // rebuild on the next call.
   TCreationOptions newOpts = creationOptions;
   newOpts.loadFromConfigFile(cfg, section);
   creationOptions = newOpts;
@@ -1619,7 +1704,8 @@ bool KeyframePointCloudMap::trySetCreationOptions(
   {
     kv.second.updateCovarianceParams(
         creationOptions.k_correspondences_for_cov, creationOptions.min_correspondences_for_cov,
-        creationOptions.max_distance_for_cov);
+        creationOptions.max_distance_for_cov, creationOptions.max_plane_deviation_for_cov,
+        creationOptions.plane_regularization_lambda);
   }
   return true;
 }
@@ -1629,7 +1715,7 @@ void KeyframePointCloudMap::saveMetricMapRepresentationToFile(
 {
   using namespace std::string_literals;
 
-  mrpt::opengl::Scene scene;
+  mrpt::viz::Scene scene;
   scene.insert(getVisualization());
   scene.saveToFile(filNamePrefix + ".3Dscene"s);
 }
@@ -1955,7 +2041,8 @@ std::shared_ptr<KeyframePointCloudMap> KeyframePointCloudMap::regroupKeyframes(
 
     auto [it, isNew] = out->keyframes_.try_emplace(
         KeyFrameID{0}, creationOptions.k_correspondences_for_cov,
-        creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov);
+        creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov,
+        creationOptions.max_plane_deviation_for_cov, creationOptions.plane_regularization_lambda);
     KeyFrame& nkf = it->second;
     nkf.timestamp = seed.timestamp;
     nkf.pose(seed.pose);
@@ -2264,7 +2351,8 @@ std::shared_ptr<KeyframePointCloudMap> KeyframePointCloudMap::regroupKeyframes(
     // Insert as a new super-keyframe (caches build lazily on first use / load).
     auto [it, isNew] = out->keyframes_.try_emplace(
         nextId, creationOptions.k_correspondences_for_cov,
-        creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov);
+        creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov,
+        creationOptions.max_plane_deviation_for_cov, creationOptions.plane_regularization_lambda);
     KeyFrame& nkf = it->second;
     nkf.timestamp = seed.timestamp;
     nkf.pose(seed.pose);
@@ -2455,6 +2543,8 @@ void KeyframePointCloudMap::TCreationOptions::loadFromConfigFile(
   MRPT_LOAD_CONFIG_VAR_REQUIRED_CS(k_correspondences_for_cov, uint64_t);
   MRPT_LOAD_CONFIG_VAR_CS(min_correspondences_for_cov, uint64_t);
   MRPT_LOAD_CONFIG_VAR_CS(max_distance_for_cov, double);
+  MRPT_LOAD_CONFIG_VAR_CS(max_plane_deviation_for_cov, double);
+  MRPT_LOAD_CONFIG_VAR_CS(plane_regularization_lambda, double);
   MRPT_LOAD_CONFIG_VAR_CS(rotation_distance_weight, double);
   MRPT_LOAD_CONFIG_VAR_CS(num_diverse_keyframes, uint64_t);
   MRPT_LOAD_CONFIG_VAR_CS(use_view_direction_filter, bool);
@@ -2473,6 +2563,8 @@ void KeyframePointCloudMap::TCreationOptions::dumpToTextStream(std::ostream& out
   LOADABLEOPTS_DUMP_VAR(k_correspondences_for_cov, int);
   LOADABLEOPTS_DUMP_VAR(min_correspondences_for_cov, int);
   LOADABLEOPTS_DUMP_VAR(max_distance_for_cov, double);
+  LOADABLEOPTS_DUMP_VAR(max_plane_deviation_for_cov, double);
+  LOADABLEOPTS_DUMP_VAR(plane_regularization_lambda, double);
   LOADABLEOPTS_DUMP_VAR(rotation_distance_weight, double);
   LOADABLEOPTS_DUMP_VAR(num_diverse_keyframes, int);
   LOADABLEOPTS_DUMP_VAR(use_view_direction_filter, bool);
@@ -2487,7 +2579,7 @@ void KeyframePointCloudMap::TCreationOptions::dumpToTextStream(std::ostream& out
 void KeyframePointCloudMap::TCreationOptions::writeToStream(
     mrpt::serialization::CArchive& out) const
 {
-  out.WriteAs<uint8_t>(7);  // version
+  out.WriteAs<uint8_t>(9);  // version
   out << max_search_keyframes << k_correspondences_for_cov;
   out << rotation_distance_weight << num_diverse_keyframes;  // v1
   out << use_view_direction_filter << max_view_angle_deg;  // v2
@@ -2496,6 +2588,8 @@ void KeyframePointCloudMap::TCreationOptions::writeToStream(
   out << approximate_cov;  // v5
   out << serialize_covariances;  // v6
   out << density_penalty_min_points << density_penalty_max_m;  // v7
+  out << max_plane_deviation_for_cov;  // v8
+  out << plane_regularization_lambda;  // v9
 }
 
 void KeyframePointCloudMap::TCreationOptions::readFromStream(mrpt::serialization::CArchive& in)
@@ -2513,6 +2607,8 @@ void KeyframePointCloudMap::TCreationOptions::readFromStream(mrpt::serialization
     case 5:
     case 6:
     case 7:
+    case 8:
+    case 9:
     {
       in >> max_search_keyframes >> k_correspondences_for_cov;
       if (version >= 1)
@@ -2543,6 +2639,14 @@ void KeyframePointCloudMap::TCreationOptions::readFromStream(mrpt::serialization
       if (version >= 7)
       {
         in >> density_penalty_min_points >> density_penalty_max_m;
+      }
+      if (version >= 8)
+      {
+        in >> max_plane_deviation_for_cov;
+      }
+      if (version >= 9)
+      {
+        in >> plane_regularization_lambda;
       }
     }
     break;
@@ -2645,7 +2749,8 @@ bool KeyframePointCloudMap::internal_insertObservation(
     // Add KF: allocate a fresh monotonic id (never reused, even after eviction).
     auto [it, isNew] = keyframes_.try_emplace(
         next_free_kf_id_++, creationOptions.k_correspondences_for_cov,
-        creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov);
+        creationOptions.min_correspondences_for_cov, creationOptions.max_distance_for_cov,
+        creationOptions.max_plane_deviation_for_cov, creationOptions.plane_regularization_lambda);
     auto& new_kf = it->second;
 
     new_kf.timestamp = obs.timestamp;
@@ -2819,7 +2924,9 @@ void KeyframePointCloudMap::KeyFrame::computeCovariancesAndDensity() const
   // nanoflann's RKNNResultSet expects the maximum SEARCH DISTANCE SQUARED:
   const float MAX_DIST_SQR_FOR_COV =
       static_cast<float>(max_distance_for_cov_ * max_distance_for_cov_);
-  const auto normalization =
+  const double MAX_PLANE_DEVIATION = max_plane_deviation_for_cov_;
+  const double PLANE_REG_LAMBDA    = plane_regularization_lambda_;
+  const auto   normalization =
       static_cast<float>(((K_CORRESPONDENCES - 1) * (2 + K_CORRESPONDENCES))) / 2;
 
   const auto& xs = pointcloud_->getPointsBufferRef_x();
@@ -2883,31 +2990,58 @@ void KeyframePointCloudMap::KeyFrame::computeCovariancesAndDensity() const
           neighbors(2, static_cast<Eigen::Index>(j)) = static_cast<double>(zs[k_indices[j]]);
         }
 
+        // Planarity gate, off when the threshold is zero.
+        //
+        // The regularization below asserts a 1000:1 plane confidence on every
+        // neighborhood it is handed. This is Fast-LIO2's own test for whether
+        // that assertion is earned: fit a least-squares plane through the
+        // neighbors, and reject the neighborhood if any of them lies farther
+        // than the threshold from it. A rejected neighborhood falls back to an
+        // isotropic covariance, exactly as the too-few-neighbors case above.
+        //
+        // The density accumulator is deliberately NOT reset on a rejection:
+        // it feeds the adaptive matching threshold, and moving that too would
+        // make this knob a two-axis change.
+        if (MAX_PLANE_DEVIATION > 0)
+        {
+          const Eigen::Vector3d              centroid = neighbors.rowwise().mean();
+          const Eigen::Matrix<double, 3, -1> centered = neighbors.colwise() - centroid;
+
+          // Eigenvalues come out ascending, so column 0 is the plane normal.
+          const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(
+              (centered * centered.transpose()).eval());
+          const Eigen::Vector3d normal = es.eigenvectors().col(0);
+
+          if ((normal.transpose() * centered).cwiseAbs().maxCoeff() > MAX_PLANE_DEVIATION)
+          {
+            cached_cov_local_[i] = mrpt::math::CMatrixFloat33::Identity();
+#if defined(MOLA_METRIC_MAPS_USE_TBB)
+            return;
+#else
+        continue;
+#endif
+          }
+        }
+
         // neighbors.colwise() -= neighbors.rowwise().mean().eval();
         neighbors.colwise() -= Eigen::Vector3d(xs[i], ys[i], zs[i]);
         const Eigen::Matrix3d cov =
             neighbors * neighbors.transpose() / static_cast<double>(k_indices.size());
 
-        // Plane regularization (see DLIO'2023 or Thrun's GICP paper)
-        // ------------------------------------------------------------
-        // Regularization of singular values.
-        Eigen::JacobiSVD<Eigen::Matrix3d> svd(cov, Eigen::ComputeFullU | Eigen::ComputeFullV);
-
-        // SVD sorts eigenvalues in decreasing order, so the last one
-        // is the smallest (normal direction of a plane):
-        const Eigen::Vector3d values = Eigen::Vector3d(1.0, 1.0, 1e-3);
-        cached_cov_local_[i] = svd.matrixU() * values.asDiagonal() * svd.matrixV().transpose();
+        // Plane regularization (see DLIO'2023 or Thrun's GICP paper), or the
+        // eigenvalues as found when it is switched off:
+        cached_cov_local_[i] = internal::shapePointCovariance(cov, PLANE_REG_LAMBDA);
 
 #if DO_VIZ_DEBUG
         if (i % 100 == 0)
         {
-          mrpt::opengl::Scene scene;
+          mrpt::viz::Scene scene;
 
-          scene.insert(mrpt::opengl::CAxis::Create());
-          scene.insert(mrpt::opengl::CGridPlaneXY::Create(-100, 100, -100, 100, 0, 5));
+          scene.insert(mrpt::viz::CAxis::Create());
+          scene.insert(mrpt::viz::CGridPlaneXY::Create(-100, 100, -100, 100, 0, 5));
 
           {
-            auto glPts = mrpt::opengl::CPointCloud::Create();
+            auto glPts = mrpt::viz::CPointCloud::Create();
 
             glPts->loadFromPointsMap(this->pointcloud().get());
             glPts->setPointSize(2.5f);
@@ -2916,7 +3050,7 @@ void KeyframePointCloudMap::KeyFrame::computeCovariancesAndDensity() const
           }
 
           {
-            auto glPts = mrpt::opengl::CPointCloud::Create();
+            auto glPts = mrpt::viz::CPointCloud::Create();
 
             for (size_t j = 0; j < k_indices.size(); j++)
             {
@@ -2928,7 +3062,7 @@ void KeyframePointCloudMap::KeyFrame::computeCovariancesAndDensity() const
           }
 
           {
-            auto glPts = mrpt::opengl::CPointCloud::Create();
+            auto glPts = mrpt::viz::CPointCloud::Create();
 
             glPts->insertPoint(xs[i], ys[i], zs[i]);
 
@@ -2938,7 +3072,7 @@ void KeyframePointCloudMap::KeyFrame::computeCovariancesAndDensity() const
           }
 
           {
-            auto glElli = mrpt::opengl::CEllipsoid3D::Create();
+            auto glElli = mrpt::viz::CEllipsoid3D::Create();
             glElli->setLocation(xs[i], ys[i], zs[i]);
             glElli->enableDrawSolid3D(false);
             glElli->setCovMatrix(cached_cov_local_[i] * 0.05);
@@ -2947,7 +3081,7 @@ void KeyframePointCloudMap::KeyFrame::computeCovariancesAndDensity() const
           }
 
           {
-            auto glEigs = mrpt::opengl::CSetOfLines::Create();
+            auto glEigs = mrpt::viz::CSetOfLines::Create();
             glEigs->setColor_u8(0x00, 0x00, 0x00, 0xff);
 
             const auto c = mrpt::math::TPoint3Df(xs[i], ys[i], zs[i]).cast<double>();
@@ -3012,7 +3146,7 @@ void KeyframePointCloudMap::KeyFrame::updateCovariancesGlobal() const
   }
 }
 
-std::shared_ptr<mrpt::opengl::CPointCloudColoured> KeyframePointCloudMap::KeyFrame::getViz(
+std::shared_ptr<mrpt::viz::CPointCloudColoured> KeyframePointCloudMap::KeyFrame::getViz(
     const TRenderOptions& ro, const std::optional<mrpt::img::TColor>& overrideColor) const
 {
   // The cache only holds the normal (non-overridden) visualization.
@@ -3022,7 +3156,7 @@ std::shared_ptr<mrpt::opengl::CPointCloudColoured> KeyframePointCloudMap::KeyFra
   }
 
   const uint8_t alpha_u8 = mrpt::f2u8(ro.color.A);
-  auto          obj      = mrpt::opengl::CPointCloudColoured::Create();
+  auto          obj      = mrpt::viz::CPointCloudColoured::Create();
 
   obj->loadFromPointsMap(pointcloud().get());
 
@@ -3057,7 +3191,7 @@ std::shared_ptr<mrpt::opengl::CPointCloudColoured> KeyframePointCloudMap::KeyFra
   return cached_viz_;
 }
 
-std::shared_ptr<mrpt::opengl::CSetOfObjects>
+std::shared_ptr<mrpt::viz::CSetOfObjects>
     KeyframePointCloudMap::KeyFrame::getCovarianceEllipsoidViz(const TRenderOptions& ro) const
 {
   buildCache();
@@ -3080,7 +3214,7 @@ std::shared_ptr<mrpt::opengl::CSetOfObjects>
     cov_decimation = 1;
   }
 
-  auto obj = mrpt::opengl::CSetOfObjects::Create();
+  auto obj = mrpt::viz::CSetOfObjects::Create();
 
   ASSERT_(pointcloud_global_);
   ASSERT_EQUAL_(cached_cov_global_.size(), pointcloud_global_->size());
@@ -3097,7 +3231,7 @@ std::shared_ptr<mrpt::opengl::CSetOfObjects>
 
     const auto& cov = cached_cov_global_[i];
 
-    auto elli = mrpt::opengl::CEllipsoid3D::Create();
+    auto elli = mrpt::viz::CEllipsoid3D::Create();
     elli->setLocation(xs[i], ys[i], zs[i]);
     elli->enableDrawSolid3D(false);
     elli->setCovMatrix(cov * 0.05);

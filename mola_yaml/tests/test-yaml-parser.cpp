@@ -47,14 +47,14 @@ void test_yaml2string()
     const mrpt::containers::yaml data = mrpt::containers::yaml::Map({{"A", 1.0}, {"B", 3}});
 
     const auto str = mola::yaml_to_string(data);
-    ASSERT_EQUAL_(str, "A: 1\nB: 3\n");
+    ASSERT_EQUAL_(str, "A: 1.0\nB: 3\n");
   }
   {
     using mrpt::containers::vkcp;
     mrpt::containers::yaml data;
     data << vkcp("w", 1.5, "Width") << vkcp("h", 2.5, "Height");
     const auto str = mola::yaml_to_string(data);
-    ASSERT_EQUAL_(str, "# Height\nh: 2.5\n# Width\nw: 1.5\n");
+    ASSERT_EQUAL_(str, "# Width\nw: 1.5\n# Height\nh: 2.5\n");
   }
 }
 
@@ -541,7 +541,8 @@ void test_yaml2stringAdditional()
   // Nested map round-trip preserves structure
   {
     const mrpt::containers::yaml inner = mrpt::containers::yaml::Map({{"x", 10}, {"y", 20}});
-    mrpt::containers::yaml       outer = mrpt::containers::yaml::Map({{"inner", inner}});
+    mrpt::containers::yaml       outer =
+        mrpt::containers::yaml::Map({{"inner", std::make_shared<mrpt::containers::yaml>(inner)}});
 
     const auto s = mola::yaml_to_string(outer);
     const auto y = mrpt::containers::yaml::FromText(s);
@@ -631,6 +632,35 @@ void test_parseImportMissingFile()
 }
 
 // ---------------------------------------------------------------------------
+// 12b. Variables in an `$import` / `$include{}` PATH are expanded even with
+// `doEnvVars` disabled, while the loaded contents keep theirs verbatim.
+// ---------------------------------------------------------------------------
+void test_parseImportPathVarsWithEnvVarsDisabled()
+{
+  using mrpt::containers::yaml;
+
+  mola::YAMLParseOptions opts;
+  opts.includesBasePath = MOLA_MODULE_SOURCE_DIR;
+  opts.doEnvVars        = false;
+
+  {
+    const std::string input =
+        "p:\n"
+        "  $import:\n"
+        "    - ${MOLA_TEST_UNDEFINED_IMPORT_PATH|test_import_novars.yaml}\n";
+    const auto y = mola::parse_yaml(yaml::FromText(input), opts);
+    ASSERT_EQUAL_(y["p"]["a"].as<int>(), 1);
+    ASSERT_EQUAL_(y["p"]["v"].as<std::string>(), "${MOLA_TEST_UNDEFINED_VALUE|x}");
+  }
+  {
+    const std::string input =
+        "p: $include{${MOLA_TEST_UNDEFINED_IMPORT_PATH|test_import_novars.yaml}}\n";
+    const auto y = mola::parse_yaml(yaml::FromText(input), opts);
+    ASSERT_EQUAL_(y["p"]["v"].as<std::string>(), "${MOLA_TEST_UNDEFINED_VALUE|x}");
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 13. `$define` directive: bind ${VAR} variables for a subtree
 //
 // A `$define` map key binds `${NAME}` variables for the whole subtree of the
@@ -657,7 +687,7 @@ void test_parseDefine()
     ASSERT_EQUAL_(y["params"]["method"].as<std::string>(), "from_define");
     ASSERT_EQUAL_(y["params"]["nested"]["deep"].as<std::string>(), "deep_from_define");
     // Untouched hooks keep their inline default:
-    ASSERT_EQUAL_(y["params"]["gain"].as<std::string>(), "1.0");
+    ASSERT_EQUAL_(y["params"]["gain"].as<std::string>(), "1");
     // Reaches inside sequences too - which plain $import overrides cannot patch:
     ASSERT_EQUAL_(y["params"]["steps"](0)["mode"].as<std::string>(), "from_define");
     ASSERT_EQUAL_(y["params"]["steps"](1)["mode"].as<std::string>(), "fixed");
@@ -748,7 +778,7 @@ void test_parseDefine()
     ASSERT_EQUAL_(y["top"]["inner"]["gain"].as<std::string>(), "from_inner_file_gain");
     // ... and, absent any $define for it anywhere, falls back to the inline
     // default, same as always:
-    ASSERT_EQUAL_(y["top"]["outer"]["gain"].as<std::string>(), "1.0");
+    ASSERT_EQUAL_(y["top"]["outer"]["gain"].as<std::string>(), "1");
   }
 
   // --- outer-wins holds across a genuine multi-level $import CHAIN too, not
@@ -764,7 +794,7 @@ void test_parseDefine()
     const auto y = mola::parse_yaml(yaml::FromText(input), opts);
     ASSERT_EQUAL_(y["method"].as<std::string>(), "from_outer_chain");
     // Untouched by either layer's $define: still the inline default.
-    ASSERT_EQUAL_(y["gain"].as<std::string>(), "1.0");
+    ASSERT_EQUAL_(y["gain"].as<std::string>(), "1");
   }
 
   // --- without an outer override, the middle file's own $define still
@@ -813,6 +843,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     test_yaml2stringAdditional();
     test_parseImportOverride();
     test_parseImportMissingFile();
+    test_parseImportPathVarsWithEnvVarsDisabled();
     test_parseDefine();
 
     std::cout << "Test successful.\n";

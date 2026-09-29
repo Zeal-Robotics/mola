@@ -22,10 +22,14 @@ find_package(mola_common REQUIRED)
 
 # find CMake dependencies:
 find_package(mola_kernel REQUIRED)
-find_package(mrpt-maps REQUIRED)
+find_package(mrpt_maps REQUIRED)
+find_package(mrpt_viz REQUIRED)
 find_package(mp2p_icp_map REQUIRED)
+find_package(Eigen3 REQUIRED NO_MODULE)
 
 find_package(TBB) # optional
+
+find_package(mola_test_datasets QUIET) # optional (for testing builds only)
 
 if(TBB_FOUND)
   option(MOLA_METRIC_MAPS_USE_TBB "If found TBB, this option controls whether to use it or not" ON)
@@ -79,6 +83,7 @@ set(LIB_SRCS
   src/register.cpp
   src/SparseTreesPointCloud.cpp
   src/SparseVoxelPointCloud.cpp
+  src/TSDF.cpp
 )
 set(LIB_PUBLIC_HDRS
   include/mola_metric_maps/FixedDenseGrid3D.h
@@ -91,6 +96,7 @@ set(LIB_PUBLIC_HDRS
   include/mola_metric_maps/OptionsIniIO.h
   include/mola_metric_maps/SparseTreesPointCloud.h
   include/mola_metric_maps/SparseVoxelPointCloud.h
+  include/mola_metric_maps/TSDF.h
 )
 
 # The map class is always built; only the k-d tree backend is conditional (see
@@ -108,13 +114,17 @@ mola_add_library(
   TARGET ${PROJECT_NAME}
   SOURCES ${LIB_SRCS} ${LIB_PUBLIC_HDRS}
   PUBLIC_LINK_LIBRARIES
-    mrpt::maps
+    mrpt::mrpt_maps
+    mrpt::mrpt_viz
     tsl::robin_map
     mola::mola_kernel
     mola::mp2p_icp_map
+  PRIVATE_LINK_LIBRARIES
+    Eigen3::Eigen
   CMAKE_DEPENDENCIES
     mola_kernel
-    mrpt-maps
+    mrpt_maps
+    mrpt_viz
     mp2p_icp_map
     robin_map
 )
@@ -122,6 +132,14 @@ mola_add_library(
 if (TBB_FOUND AND MOLA_METRIC_MAPS_USE_TBB)
   target_compile_definitions(${PROJECT_NAME} PRIVATE MOLA_METRIC_MAPS_USE_TBB)
   target_link_libraries(${PROJECT_NAME} PRIVATE TBB::tbb)
+
+  # Sorting mp2p_icp::point_with_cov_pair_t (which embeds an over-aligned
+  # Eigen-backed covariance matrix) makes GCC emit a -Wpsabi note about an
+  # internal ABI change. The affected comparator never crosses a shared-library
+  # boundary, so the note is safe to silence.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(${PROJECT_NAME} PRIVATE -Wno-psabi)
+  endif()
 endif()
 
 if(MOLA_HAS_INCREMENTAL_POINT_CLOUD)

@@ -1,6 +1,6 @@
 *.pyc
 build
-build-*
+build-*/
 *~
 install*
 log
@@ -20,10 +20,16 @@ docs/source/group*.rst
 docs/source/namespace*.rst
 docs/source/page*.rst
 docs/source/struct*.rst
+docs/source/union*.rst
 docs/source/xml-dir/
 install_manifest.txt
 Makefile
 Testing
+
+# local colcon skip markers: they must not be committed, or CI (and any
+# fresh workspace) would silently skip building those packages.
+# Note: docs/COLCON_IGNORE is tracked on purpose (not a ROS package).
+COLCON_IGNORE
 
 #visual studio
 .vs/*

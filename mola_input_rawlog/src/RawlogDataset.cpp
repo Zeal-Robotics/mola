@@ -43,6 +43,34 @@ MRPT_INITIALIZER(do_register_RawlogDataset)  // NOLINT(misc-use-anonymous-namesp
 
 RawlogDataset::RawlogDataset() = default;
 
+std::optional<mrpt::Clock::time_point> RawlogDataset::findEntryTimestamp(bool fromEnd) const
+{
+  const size_t n = rawlog_entire_.size();
+  for (size_t k = 0; k < n; k++)
+  {
+    const size_t idx = fromEnd ? (n - 1 - k) : k;
+
+    switch (rawlog_entire_.getType(idx))
+    {
+      case mrpt::obs::CRawlog::TEntryType::etObservation:
+        if (auto o = rawlog_entire_.getAsObservation(idx); o)
+        {
+          return o->timestamp;
+        }
+        break;
+      case mrpt::obs::CRawlog::TEntryType::etSensoryFrame:
+        if (auto sf = rawlog_entire_.getAsObservations(idx); sf && !sf->empty())
+        {
+          return (*sf->begin())->timestamp;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  return {};
+}
+
 void RawlogDataset::initialize_rds(const Yaml& c)
 {
   using namespace std::string_literals;
@@ -74,9 +102,18 @@ void RawlogDataset::initialize_rds(const Yaml& c)
   {
     MRPT_LOG_INFO_STREAM("Reading the whole rawlog dataset: " << rawlog_filename_);
 
-    rawlog_entire_.loadFromRawLogFile(rawlog_filename_);
+    const bool loadOk = rawlog_entire_.loadFromRawLogFile(rawlog_filename_);
+    ASSERTMSG_(loadOk, "Error loading rawlog file.");
 
     MRPT_LOG_INFO_STREAM("Read ok, with " << rawlog_entire_.size() << " entries.");
+
+    // Dataset duration, for the GUI: first and last valid timestamps.
+    const auto tFirst = findEntryTimestamp(false /*from begin*/);
+    const auto tLast  = findEntryTimestamp(true /*from end*/);
+    if (tFirst && tLast)
+    {
+      dataset_total_time_ = mrpt::system::timeDifference(*tFirst, *tLast);
+    }
   }
   else
   {
@@ -165,10 +202,13 @@ void RawlogDataset::spinOnce()
                       << mrpt::system::dateTimeLocalToString(obs->timestamp));
   }
 
-  if (read_all_first_)
   {
-    auto lck             = mrpt::lockHelper(dataset_ui_mtx_);
-    last_used_tim_index_ = rawlog_next_idx_;
+    auto lck = mrpt::lockHelper(dataset_ui_mtx_);
+    if (read_all_first_)
+    {
+      last_used_tim_index_ = rawlog_next_idx_;
+    }
+    ui_dataset_time_ = last_dataset_time_;
   }
 
   MRPT_END
@@ -298,7 +338,8 @@ mrpt::obs::CSensoryFrame::Ptr RawlogDataset::datasetGetObservations(size_t times
     last_used_tim_index_ = timestep;
   }
 
-  const auto obj = rawlog_entire_.getAsGeneric(timestep);
+  auto objConst = rawlog_entire_.getAsGeneric(timestep);
+  auto obj      = std::const_pointer_cast<mrpt::serialization::CSerializable>(objConst);
 
   auto sfRet = mrpt::obs::CSensoryFrame::Create();
 

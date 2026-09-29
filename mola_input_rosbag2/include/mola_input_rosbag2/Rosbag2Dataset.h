@@ -108,6 +108,16 @@ class Rosbag2Dataset : public RawDataSourceBase,
     auto lck       = mrpt::lockHelper(dataset_ui_mtx_);
     teleport_here_ = timestep;
   }
+  std::optional<double> datasetUI_time() const override
+  {
+    auto lck = mrpt::lockHelper(dataset_ui_mtx_);
+    return ui_dataset_time_;
+  }
+  std::optional<double> datasetUI_total_time() const override
+  {
+    auto lck = mrpt::lockHelper(dataset_ui_mtx_);
+    return dataset_total_time_;
+  }
 
   // Virtual interface of TransformTreeSource (see docs in base class)
   std::optional<TransformTree> transform_tree(
@@ -160,6 +170,12 @@ class Rosbag2Dataset : public RawDataSourceBase,
 
   std::optional<mrpt::Clock::time_point> last_play_wallclock_time_;
   double                                 last_dataset_time_ = 0;
+
+  /// Copy of last_dataset_time_ for the GUI, guarded by dataset_ui_mtx_.
+  double ui_dataset_time_ = 0;
+
+  /// Total duration of all input bags [s], from their metadata.
+  std::optional<double> dataset_total_time_;
 
   std::shared_ptr<rosbag2_cpp::readers::SequentialReader> reader_;
   size_t                                                  bagMessageCount_ = 0;
@@ -250,6 +266,20 @@ class Rosbag2Dataset : public RawDataSourceBase,
       mrpt::poses::CPose3D& des, const std::string& target_frame, const std::string& source_frame,
       const std::optional<mrpt::poses::CPose3D>& fixedSensorPose, const std::string_view label);
 #endif
+
+  /// Builds a CObservationRobotPose, which carries a full SE(3) pose plus its
+  /// 6x6 covariance, from `nav_msgs/msg/Odometry`,
+  /// `geometry_msgs/msg/PoseWithCovarianceStamped` or
+  /// `geometry_msgs/msg/PoseStamped`. `rosMsgType` selects which, since all of
+  /// them map to this one MRPT class.
+  ///
+  /// For `nav_msgs/msg/Odometry` this is the lossless alternative to
+  /// toOdometry(): CObservationOdometry is planar, so it can only carry
+  /// (x, y, yaw) and a 2D twist, dropping z, roll, pitch and the covariance a
+  /// 3D source (legged robot, VIO, aerial platform) actually publishes.
+  Obs toRobotPose(
+      std::string_view msg, const rosbag2_storage::SerializedBagMessage& rosmsg,
+      const std::string& rosMsgType, const std::optional<mrpt::poses::CPose3D>& fixedSensorPose);
 
   Obs catchExceptions(const std::function<Obs()>& f);
 

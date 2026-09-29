@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_yaml</name>
-  <version>3.1.0</version>
+  <version>3.3.0</version>
   <description>YAML helper library common to MOLA modules</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -16,7 +16,8 @@
 
   <depend>mola_common</depend>
 
-  <depend>mrpt_libbase</depend>
+  <depend>mrpt_containers</depend>
+  <depend>mrpt_system</depend>
 
   <doc_depend>doxygen</doc_depend>
 

@@ -5,7 +5,7 @@
 -->
 <package format="3">
   <name>mola_relocalization</name>
-  <version>3.1.0</version>
+  <version>3.3.0</version>
   <description>C++ library with algorithms for relocalization, global localization, or pose estimation given a large initial uncertainty</description>
 
   <maintainer email="joseluisblancoc@gmail.com">Jose-Luis Blanco-Claraco</maintainer>
@@ -18,9 +18,8 @@
   <depend>mp2p_icp</depend>
   <depend>mola_pose_list</depend>
 
-  <depend>mrpt_libobs</depend>
-  <depend>mrpt_libslam</depend>
-  <depend>mrpt_libmaps</depend>
+  <depend>mrpt_obs</depend>
+  <depend>mrpt_maps</depend>
 
   <test_depend>mola_test_datasets</test_depend>
 

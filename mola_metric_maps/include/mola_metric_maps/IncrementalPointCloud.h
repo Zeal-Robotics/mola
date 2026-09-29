@@ -29,6 +29,7 @@
  *  failing earlier with a confusing "no such registered CMetricMap class".
  */
 
+#include <mola_metric_maps/MatchingDistanceProfileCompat.h>
 #include <mola_metric_maps/OptionsCapable.h>
 #include <mp2p_icp/NearestPointWithCovCapable.h>
 #include <mrpt/config/CLoadableOptions.h>
@@ -37,6 +38,7 @@
 #include <mrpt/math/CMatrixFixed.h>
 #include <mrpt/math/TPoint3D.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -98,17 +100,27 @@ class IncrementalKDTree;
  * coordinates; that fraction is bounded by
  * `TCreationOptions::alpha_deleted`.
  *
+ * ## The inherited static k-d tree is disabled
+ * `CPointsMap` also carries the cached, rebuilt-from-scratch index of
+ * `mrpt::math::KDTreeCapable` (`kdTreeNClosestPoint3D*()` and friends). That
+ * index is built over the *raw storage*, i.e. over the tombstoned and blanked
+ * slots too, so its answers on this class would be meaningless; and building it
+ * concurrently with an insertion is a data race on the coordinate buffers.
+ *
+ * It is therefore switched off here via `kdtree_disable()`, and every one of
+ * those inherited methods throws `std::logic_error` explaining what to use
+ * instead: the `nn_*()` methods of `mrpt::maps::NearestNeighborsCapable`, or
+ * `liveCompactedCopy()` for a plain points map that any other API can query.
+ * Generic code holding this map as a `mrpt::maps::CPointsMap` therefore fails
+ * loudly rather than silently returning neighbors that do not exist.
+ *
+ * @note Requires an MRPT providing the opt-out (feature macro
+ *       `MRPT_HAS_KDTREE_CAPABLE_DISABLE`). Without it the inherited methods
+ *       stay reachable and keep their old, unsupported behavior.
+ *
  * @note Thread-safety: all index access is serialized internally, so a mapping
  *       thread and an ICP thread may use the map concurrently through the
  *       `nn_*` and `insert*` APIs.
- *       The one exception is the *generic* `mrpt::math::KDTreeCapable` API
- *       inherited from `CPointsMap` (`kdTreeNClosestPoint3D*()` and friends),
- *       which builds its own static tree over the raw storage: that tree's
- *       construction calls back into `boundingBox()`, so it takes MRPT's k-d
- *       tree mutex and then ours, while insertion takes them the other way
- *       round. Use those methods only from a single thread, and prefer
- *       `liveCompactedCopy()` anyway, since the raw storage they see includes
- *       the tombstoned and blanked slots.
  */
 class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
                               public mp2p_icp::NearestPointWithCovCapable,
@@ -133,6 +145,19 @@ class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
 
   /** Number of storage slots ready to be reused by the next insertion. */
   [[nodiscard]] std::size_t recyclableSlotCount() const;
+
+  /** Number of per-point covariance estimations run so far, i.e. cache misses
+   *  plus the points whose neighborhood never qualified for caching. For
+   *  diagnostics and benchmarks.
+   *  \sa TCreationOptions::min_neighbors_to_cache_cov
+   */
+  [[nodiscard]] uint64_t covarianceComputations() const
+  {
+    return cov_computations_.load(std::memory_order_relaxed);
+  }
+
+  /** Number of points whose covariance is currently held in the cache. */
+  [[nodiscard]] std::size_t cachedCovarianceCount() const;
 
   /** Physically drops the tombstoned storage slots (so `size()` becomes
    *  `livePointCount()`) and rebuilds the k-d tree with the current
@@ -242,8 +267,14 @@ class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
    */
   void nn_search_cov2cov(
       const NearestPointWithCovCapable& localMap, const mrpt::poses::CPose3D& localMapPose,
-      const float                        max_search_distance,
-      mp2p_icp::MatchedPointWithCovList& outPairings) const override;
+      float max_search_distance, mp2p_icp::MatchedPointWithCovList& outPairings) const override;
+
+#if defined(MP2P_ICP_HAS_MATCHING_DISTANCE_PROFILE)
+  void nn_search_cov2cov(
+      const NearestPointWithCovCapable& localMap, const mrpt::poses::CPose3D& localMapPose,
+      const mp2p_icp::MatchingDistanceProfile& matchingDistance,
+      mp2p_icp::MatchedPointWithCovList&       outPairings) const override;
+#endif
 
   [[nodiscard]] std::size_t point_count() const override;
 
@@ -253,9 +284,9 @@ class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
    *  @{ */
   std::string asString() const override;
   bool        isEmpty() const override;
-  void        getVisualizationInto(mrpt::opengl::CSetOfObjects& outObj) const override;
+  void        getVisualizationInto(mrpt::viz::CSetOfObjects& outObj) const override;
   void        saveMetricMapRepresentationToFile(const std::string& filNamePrefix) const override;
-  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const override;
+  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const;
   /** @} */
 
   /** All parameters specific to this class. The standard `insertionOptions`,
@@ -331,6 +362,44 @@ class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
     /** Maximum distance [m] to search neighbors for the covariance estimate. */
     double max_distance_for_cov = 1.0;
 
+    /** Minimum number of neighbors that must have been found for a computed
+     *  per-point covariance to be stored in the cache. A point whose
+     *  neighborhood was still too thin is left uncached and recomputed on the
+     *  next query, by which time the map may have densified around it, so an
+     *  unreliable estimate (in particular the isotropic fallback) is never
+     *  frozen for the whole life of the point.
+     *
+     *  0 (default) means `k_correspondences_for_cov`, i.e. only a full
+     *  neighborhood is trusted. 1 caches every result, which is cheapest but
+     *  never revisits an early estimate. A value above
+     *  `k_correspondences_for_cov` can never be met, which disables the cache
+     *  altogether: every query is then exact, at a large cost.
+     *
+     *  @note Eviction is not covered: a point that was already well populated
+     *  keeps its covariance when its neighbors are trimmed away.
+     */
+    uint32_t min_neighbors_to_cache_cov = 0;
+
+    /** Maximum distance [m] any neighbor may sit from the least-squares plane
+     *  through the neighborhood for that neighborhood to receive the plane
+     *  regularization below. 0 (default) disables the test. Same semantics as
+     *  the option of the same name on KeyframePointCloudMap. */
+    double max_plane_deviation_for_cov = 0;
+
+    /** Variance asserted along the estimated surface normal, the other two
+     *  being 1, i.e. the plane confidence ratio written as its reciprocal. The
+     *  shipped 1e-3 asserts 1000:1.
+     *
+     *  Values in (0, 1] regularize that way. A value <= 0 switches the
+     *  regularization off and keeps the eigenvalues the neighborhood actually
+     *  produced, so a sparse or rough neighborhood carries less information
+     *  than a dense flat one instead of the same amount; the magnitude is then
+     *  a floor on the smaller eigenvalues, relative to the largest one. The
+     *  two regimes are not on the same scale, since kept eigenvalues carry
+     *  squared metric units. Same semantics as the option of the same name on
+     *  KeyframePointCloudMap. */
+    double plane_regularization_lambda = 1e-3;
+
     /** If `true`, the k-d tree index is serialized alongside the points (see
      *  `IncrementalPointCloud` serialization), so it does NOT have to be
      *  rebuilt (an O(N log N) bulk build) when the map is loaded. Requires an
@@ -372,6 +441,20 @@ class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
       const std::optional<const mrpt::poses::CPose3D>& robotPose = std::nullopt) override;
 
  private:
+  /** Declares the static k-d tree inherited from `mrpt::math::KDTreeCapable`
+   *  unsupported for this class, so that its query methods throw instead of
+   *  indexing the raw storage. Called from every constructor; a no-op when
+   *  built against an MRPT without the opt-out.
+   */
+  void disableInheritedKDTree();
+
+  /// The actual cov2cov search. Both public overloads forward here, so the
+  /// implementation stays free of preprocessor branches.
+  void nn_search_cov2cov_impl(
+      const NearestPointWithCovCapable& localMap, const mrpt::poses::CPose3D& localMapPose,
+      const MatchingDistanceProfile&     matchingDistance,
+      mp2p_icp::MatchedPointWithCovList& outPairings) const;
+
   /// Serializes all access to index_ and to the caches below.
   mutable std::recursive_mutex mtx_;
 
@@ -394,6 +477,9 @@ class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
   /// Per-point, plane-regularized covariance cache, in this map's frame.
   mutable std::vector<mrpt::math::CMatrixFloat33> cov_;
   mutable std::vector<uint8_t>                    cov_valid_;
+
+  /// Diagnostics only: how many times a point covariance has been estimated.
+  mutable std::atomic<uint64_t> cov_computations_{0};
 
   /// Used for getAsSimplePointsMap() only.
   mutable mrpt::maps::CSimplePointsMap::Ptr cachedPoints_;
@@ -454,8 +540,14 @@ class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
   /// Collects the slots the index reclaimed, blanks them and marks them reusable.
   void harvestRemovedSlots();
 
-  /// Computes and caches the covariance of one live point, if not cached yet.
+  /** Computes the covariance of one live point, unless it is already cached,
+   *  and caches it only if its neighborhood was populated enough.
+   *  \sa TCreationOptions::min_neighbors_to_cache_cov
+   */
   void computeCovariance(uint32_t slot) const;
+
+  /// Neighbors required to cache a covariance, resolving the "0 = auto" case.
+  [[nodiscard]] std::size_t covCacheThreshold() const;
 
   /** Fills the covariance cache for the given slots, in parallel when TBB is
    *  available. The caller must pass each slot at most once, so that threads
