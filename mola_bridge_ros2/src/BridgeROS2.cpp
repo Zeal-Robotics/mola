@@ -960,6 +960,12 @@ void BridgeROS2::callbackOnImu(
   auto obs = mrpt::obs::CObservationIMU::Create();
   mrpt::ros2bridge::fromROS(o, *obs);
 
+  // The reading's instant is the message header's, as for every other sensor
+  // here. The conversion above leaves the observation stamped with the wall
+  // clock, which is off by the transport latency on a live vehicle and by hours
+  // on a replayed bag, so the front end never pairs the readings with the scans
+  // they cover.
+  obs->timestamp   = mrpt::ros2bridge::fromROS(o.header.stamp);
   obs->sensorPose  = sensorPose;
   obs->sensorLabel = outSensorLabel;
 
