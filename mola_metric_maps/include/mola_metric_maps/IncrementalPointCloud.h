@@ -29,6 +29,7 @@
  *  failing earlier with a confusing "no such registered CMetricMap class".
  */
 
+#include <mola_kernel/PointsMapViewCapable.h>
 #include <mola_metric_maps/MatchingDistanceProfileCompat.h>
 #include <mola_metric_maps/OptionsCapable.h>
 #include <mp2p_icp/NearestPointWithCovCapable.h>
@@ -124,7 +125,8 @@ class IncrementalKDTree;
  */
 class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
                               public mp2p_icp::NearestPointWithCovCapable,
-                              public mola::OptionsCapable
+                              public mola::OptionsCapable,
+                              public mola::PointsMapViewCapable
 {
   DEFINE_SERIALIZABLE(IncrementalPointCloud, mola)
 
@@ -286,7 +288,7 @@ class IncrementalPointCloud : public mrpt::maps::CGenericPointsMap,
   bool        isEmpty() const override;
   void        getVisualizationInto(mrpt::viz::CSetOfObjects& outObj) const override;
   void        saveMetricMapRepresentationToFile(const std::string& filNamePrefix) const override;
-  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const;
+  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const override;
   /** @} */
 
   /** All parameters specific to this class. The standard `insertionOptions`,

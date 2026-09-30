@@ -26,6 +26,7 @@
 #include <mola_bridge_ros2/BridgeROS2.h>
 
 // MOLA/MRPT:
+#include <mola_kernel/PointsMapViewCapable.h>
 #include <mola_kernel/interfaces/DiagnosticsProvider.h>
 #include <mola_kernel/pretty_print_exception.h>
 #include <mola_yaml/yaml_helpers.h>
@@ -2228,11 +2229,8 @@ void BridgeROS2::timerPubMapLayer(const std::string& layerName, const MapSourceB
   // Not empty?
   else if (mu.map)
   {
-    // Try to publish it via its points-map representation. MRPT retired
-    // CMetricMap::getAsSimplePointsMap() in favour of the free function
-    // mrpt::maps::asPointsMap(), which answers for any points map rather than
-    // only for CSimplePointsMap.
-    const auto* pts = mrpt::maps::asPointsMap(*mu.map);
+    // Try to publish it via its points-map representation:
+    const auto* pts = mola::asPointsMap(*mu.map);
     if (pts == nullptr)
     {
       MRPT_LOG_WARN_STREAM(

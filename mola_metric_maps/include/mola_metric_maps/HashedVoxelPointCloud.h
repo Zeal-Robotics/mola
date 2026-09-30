@@ -18,6 +18,7 @@
  */
 #pragma once
 
+#include <mola_kernel/PointsMapViewCapable.h>
 #include <mola_metric_maps/OptionsCapable.h>
 #include <mola_metric_maps/index3d_t.h>
 #include <mrpt/core/round.h>
@@ -62,7 +63,8 @@ namespace mola
  */
 class HashedVoxelPointCloud : public mrpt::maps::CMetricMap,
                               public mrpt::maps::NearestNeighborsCapable,
-                              public mola::OptionsCapable
+                              public mola::OptionsCapable,
+                              public mola::PointsMapViewCapable
 {
   DEFINE_SERIALIZABLE(HashedVoxelPointCloud, mola)
  public:
@@ -348,7 +350,7 @@ class HashedVoxelPointCloud : public mrpt::maps::CMetricMap,
 
   /// Returns a cached point cloud view of the hash map.
   /// Not efficient at all. Only for MOLA->ROS2 bridge.
-  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const;
+  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const override;
 
   /** @} */
 

@@ -18,6 +18,7 @@
  */
 #pragma once
 
+#include <mola_kernel/PointsMapViewCapable.h>
 #include <mola_metric_maps/OptionsCapable.h>
 #include <mola_metric_maps/index3d_t.h>
 #include <mp2p_icp/NearestPlaneCapable.h>
@@ -65,7 +66,8 @@ namespace mola
  */
 class TSDF : public mrpt::maps::CMetricMap,
              public mp2p_icp::NearestPlaneCapable,
-             public mola::OptionsCapable
+             public mola::OptionsCapable,
+             public mola::PointsMapViewCapable
 {
   DEFINE_SERIALIZABLE(TSDF, mola)
  public:
@@ -229,7 +231,7 @@ class TSDF : public mrpt::maps::CMetricMap,
 
   /// Zero-crossing points of the field, for visualization and for the
   /// MOLA->ROS2 bridge only. Not efficient.
-  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const;
+  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const override;
 
   /** @} */
 

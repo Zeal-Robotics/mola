@@ -18,6 +18,7 @@
  */
 #pragma once
 
+#include <mola_kernel/PointsMapViewCapable.h>
 #include <mola_metric_maps/MatchingDistanceProfileCompat.h>
 #include <mola_metric_maps/OptionsCapable.h>
 #include <mp2p_icp/IcpPrepareCapable.h>
@@ -83,7 +84,8 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
                               public mp2p_icp::IcpPrepareCapable,
                               public mp2p_icp::NearestPointWithCovCapable,
                               public mp2p_icp::MetricMapMergeCapable,
-                              public mola::OptionsCapable
+                              public mola::OptionsCapable,
+                              public mola::PointsMapViewCapable
 {
   DEFINE_SERIALIZABLE(KeyframePointCloudMap, mola)
  public:
@@ -258,7 +260,7 @@ class KeyframePointCloudMap : public mrpt::maps::CMetricMap,
 
   /// Returns a cached point cloud view of the entire map.
   /// Not efficient at all. Only for MOLA->ROS2 bridge.
-  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const;
+  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const override;
 
   /** @} */
 

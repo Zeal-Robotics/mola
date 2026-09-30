@@ -18,6 +18,7 @@
  */
 #pragma once
 
+#include <mola_kernel/PointsMapViewCapable.h>
 #include <mola_metric_maps/OptionsCapable.h>
 #include <mola_metric_maps/index3d_t.h>
 #include <mp2p_icp/NearestPlaneCapable.h>
@@ -69,7 +70,8 @@ namespace mola
 class NDT : public mrpt::maps::CMetricMap,
             public mrpt::maps::NearestNeighborsCapable,
             public mp2p_icp::NearestPlaneCapable,
-            public mola::OptionsCapable
+            public mola::OptionsCapable,
+            public mola::PointsMapViewCapable
 {
   DEFINE_SERIALIZABLE(NDT, mola)
  public:
@@ -415,7 +417,7 @@ class NDT : public mrpt::maps::CMetricMap,
 
   /// Returns a cached point cloud view of the hash map.
   /// Not efficient at all. Only for MOLA->ROS2 bridge.
-  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const;
+  const mrpt::maps::CSimplePointsMap* getAsSimplePointsMap() const override;
 
   /** @} */
 

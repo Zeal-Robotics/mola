@@ -63,6 +63,7 @@ set(LIB_PUBLIC_HDRS
   include/mola_kernel/interfaces/TransformTreeSource.h
   include/mola_kernel/interfaces/VizInterface.h
   include/mola_kernel/MinimalModuleContainer.h
+  include/mola_kernel/PointsMapViewCapable.h
   include/mola_kernel/pretty_print_exception.h
   include/mola_kernel/utils/RegexCache.h
   include/mola_kernel/utils/Synchronizer.h
