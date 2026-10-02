@@ -2003,12 +2003,19 @@ void BridgeROS2::publishLocalizationTf(const LocalizationSourceBase::Localizatio
     tf.header.frame_id = l.reference_frame;
   }
 
+  // A state estimator that publishes map -> odom itself hands over the same
+  // slowly varying correction the REP-105 branch composes, so it is stamped
+  // and rebroadcast the same way. Stamped at its own time instead, it trails
+  // every consumer's lookup by up to one publish period, and a lookup of
+  // map -> anything at a fresh sensor stamp fails as an extrapolation.
+  const bool isMapToOdom = useRep105 || l.child_frame == params_.odom_frame;
+
   // Cache the latest computed TF so the rebroadcast timer (and any future
   // calls) can re-emit it with a fresh stamp; the stamp itself is set at
   // broadcast time inside broadcastCachedLocalizationTf().
   {
     auto lck              = mrpt::lockHelper(cachedLocalizationTfMtx_);
-    cachedLocalizationTf_ = CachedLocalizationTf{tf, useRep105, l.timestamp};
+    cachedLocalizationTf_ = CachedLocalizationTf{tf, isMapToOdom, l.timestamp};
   }
 
   // Immediate broadcast so consumers see the new pose without waiting for the
