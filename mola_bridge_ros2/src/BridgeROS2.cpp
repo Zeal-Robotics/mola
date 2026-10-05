@@ -497,6 +497,7 @@ void BridgeROS2::initialize_rds(const Yaml& c)
 
   YAML_LOAD_OPT(params_, publish_odometry_msgs_from_slam, bool);
   YAML_LOAD_OPT(params_, publish_odometry_msgs_from_slam_source, std::string);
+  YAML_LOAD_OPT(params_, publish_registration_msgs_from_slam_source, std::string);
 
   YAML_LOAD_OPT(params_, publish_tf_from_slam, bool);
   YAML_LOAD_OPT(params_, publish_tf_from_slam_source, std::string);
@@ -1875,6 +1876,7 @@ void BridgeROS2::publishSingleLocalization(
 
   // 2) Publish Odometry msg:
   publishLocalizationOdom(l);
+  publishLocalizationRegistration(l);
 
   // 3) and always publish quality:
   publishLocalizationQuality(l);
@@ -2079,8 +2081,28 @@ void BridgeROS2::publishLocalizationOdom(const LocalizationSourceBase::Localizat
   const std::string locLabel = (l.method.empty() ? "slam"s : l.method) + "/pose"s;
 
   auto pubOdo = get_publisher<nav_msgs::msg::Odometry>(locLabel, rclcpp::SystemDefaultsQoS());
+  pubOdo->publish(toOdometryMsg(l));
+}
 
-  // Convert observation MRPT -> ROS
+void BridgeROS2::publishLocalizationRegistration(
+    const LocalizationSourceBase::LocalizationUpdate& l)
+{
+  using namespace std::string_literals;
+
+  if (params_.publish_registration_msgs_from_slam_source.empty() ||
+      params_.publish_registration_msgs_from_slam_source != l.method || !(l.quality > 0))
+  {
+    return;
+  }
+
+  auto pub = get_publisher<nav_msgs::msg::Odometry>(
+      l.method + "/registration"s, rclcpp::SystemDefaultsQoS());
+  pub->publish(toOdometryMsg(l));
+}
+
+nav_msgs::msg::Odometry BridgeROS2::toOdometryMsg(
+    const LocalizationSourceBase::LocalizationUpdate& l) const
+{
   nav_msgs::msg::Odometry msg;
   msg.header.stamp    = myNow(l.timestamp);
   msg.child_frame_id  = l.child_frame;
@@ -2094,8 +2116,7 @@ void BridgeROS2::publishLocalizationOdom(const LocalizationSourceBase::Localizat
   }
 
   msg.pose = mrpt::ros2bridge::toROS_Pose(posePdf);
-
-  pubOdo->publish(msg);
+  return msg;
 }
 
 void BridgeROS2::publishLocalizationQuality(const LocalizationSourceBase::LocalizationUpdate& l)

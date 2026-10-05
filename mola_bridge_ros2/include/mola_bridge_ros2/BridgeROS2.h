@@ -188,6 +188,11 @@ class BridgeROS2 : public RawDataSourceBase,
     // Which source will be forwarded (empty=any)
     std::string publish_odometry_msgs_from_slam_source;
 
+    /// If not empty, the updates of this source that carry a non-zero quality, its accepted
+    /// registrations and never a prediction, are also published as nav_msgs/Odometry on
+    /// ``<source>/registration``, whatever source the other publishing follows.
+    std::string publish_registration_msgs_from_slam_source;
+
     /// If enabled, SLAM/Localization results will be published as tf messages, for frames
     /// according to explained above for `publish_localization_following_rep105`.
     bool publish_tf_from_slam = true;
@@ -431,6 +436,8 @@ class BridgeROS2 : public RawDataSourceBase,
   // Different publish localization parts:
   void publishLocalizationTf(const LocalizationSourceBase::LocalizationUpdate& l);
   void publishLocalizationOdom(const LocalizationSourceBase::LocalizationUpdate& l);
+  void publishLocalizationRegistration(const LocalizationSourceBase::LocalizationUpdate& l);
+  nav_msgs::msg::Odometry toOdometryMsg(const LocalizationSourceBase::LocalizationUpdate& l) const;
   void publishLocalizationQuality(const LocalizationSourceBase::LocalizationUpdate& l);
   void publishLocalizationGeoRef(const LocalizationSourceBase::LocalizationUpdate& l);
 
