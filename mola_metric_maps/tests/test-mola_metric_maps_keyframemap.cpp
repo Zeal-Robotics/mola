@@ -755,6 +755,71 @@ void test_view_filter_heading_sweep_pairing_accepted()
   }
 }
 
+/// Re-expresses map-frame points {x, y, z, view_x, view_y, view_z} in the
+/// local frame of a keyframe at `kfPose`, the frame a keyframe stores them in.
+std::vector<std::array<float, 6>> toKeyframeFrame(
+    const std::vector<std::array<float, 6>>& mapPts, const mrpt::poses::CPose3D& kfPose)
+{
+  std::vector<std::array<float, 6>> out;
+  out.reserve(mapPts.size());
+  for (const auto& p : mapPts)
+  {
+    const auto pt = kfPose.inverseComposePoint(mrpt::math::TPoint3D(p[0], p[1], p[2]));
+    const auto v  = kfPose.inverseRotateVector(mrpt::math::TVector3D(p[3], p[4], p[5]));
+    out.push_back(
+        {static_cast<float>(pt.x), static_cast<float>(pt.y), static_cast<float>(pt.z),
+         static_cast<float>(v.x), static_cast<float>(v.y), static_cast<float>(v.z)});
+  }
+  return out;
+}
+
+/// Whether a query point at `q` (map frame, query map at the identity), seen
+/// along `qView`, pairs with the reference point at `p` under the view filter
+/// at its default threshold.
+bool pairsUnderViewFilter(
+    mola::KeyframePointCloudMap& ref, const mrpt::math::TPoint3Df& q,
+    const mrpt::math::TPoint3Df& p, const mrpt::math::TVector3Df& qView)
+{
+  auto local_pts = makeGridPts(q.z, 0.f, 0.f, 1.f, 10, 10);  // bg, for covariances
+  appendPt(local_pts, q.x, q.y, q.z, qView.x, qView.y, qView.z);
+  auto local_m = makeMapFromCloud(makeCloudWithViews(local_pts));
+
+  ref.creationOptions.use_view_direction_filter = true;
+  ref.creationOptions.max_view_angle_deg        = 120.0;
+
+  mp2p_icp::MatchedPointWithCovList pairings;
+  ref.nn_search_cov2cov(local_m, mrpt::poses::CPose3D::Identity(), 1.0f, pairings);
+  return hasPairing(pairings, q, p);
+}
+
+// ── 17b. View filter: the reference KF has a non-trivial heading ──────────
+//
+// The tests above turn only the query frame and keep the reference KF at the
+// identity, where its view vectors read the same rotated once or twice. Here
+// the reference KF holds the same map-frame geometry at every heading, so the
+// pairing must not change with it: Q seen from P's side pairs with P, and Q
+// seen from the opposite side does not.
+void test_view_filter_reference_keyframe_heading_sweep()
+{
+  const mrpt::math::TPoint3Df P{50.f, 0.f, 0.f};
+  const mrpt::math::TPoint3Df Q{50.f, 0.f, 0.02f};
+
+  auto map_pts = makeGridPts(0.f, 0.f, 0.f, 1.f, 10, 10);  // bg: view=(0,0,+1)
+  appendPt(map_pts, P.x, P.y, P.z, 0.f, +1.f, 0.f);  // P: view=(0,+1,0)
+
+  for (const double heading_deg : {0.0, 90.0, 180.0, 270.0})
+  {
+    const auto kfPose = mrpt::poses::CPose3D::FromXYZYawPitchRoll(
+        3.0, -2.0, 0.0, mrpt::DEG2RAD(heading_deg), 0.0, 0.0);
+
+    auto ref_m = makeMapFromCloud(makeCloudWithViews(toKeyframeFrame(map_pts, kfPose)), kfPose);
+    ref_m.icp_get_prepared_as_global(mrpt::poses::CPose3D::Identity());
+
+    ASSERT_(pairsUnderViewFilter(ref_m, Q, P, {0.f, +1.f, 0.f}));
+    ASSERT_(!pairsUnderViewFilter(ref_m, Q, P, {0.f, -1.f, 0.f}));
+  }
+}
+
 // ── 19. Per-KF pose plumbing ──────────────────────────────────────────────
 //
 // Covers:
@@ -1063,6 +1128,46 @@ void test_regroup_decimation_preserves_views()
 
   // View fields survived decimation -> the opposite-view pair was rejected.
   ASSERT_LT_(pairingsOn.size(), pairingsOff.size());
+}
+
+// ── 26b. Regroup: a super-keyframe anchored at a heading keeps map-frame views ──
+//
+// A super-keyframe re-expresses its members' map-frame clouds in the seed's
+// local frame. With the seed at a non-trivial heading, the views the filter
+// compares must still be the map-frame ones the members were built from.
+void test_regroup_rotated_anchor_preserves_views()
+{
+  const mrpt::math::TPoint3Df P{20.f, 0.f, 0.f};
+  const mrpt::math::TPoint3Df Q{20.f, 0.f, 0.02f};
+  const auto                  kfPose =
+      mrpt::poses::CPose3D::FromXYZYawPitchRoll(3.0, -2.0, 0.0, mrpt::DEG2RAD(90.0), 0.0, 0.0);
+
+  auto map_pts = makeGridPts(0.f, 0.f, 0.f, 1.f, 10, 10);  // bg: view=(0,0,+1)
+  appendPt(map_pts, P.x, P.y, P.z, 0.f, +1.f, 0.f);  // P: view=(0,+1,0)
+
+  for (const double decimateVoxel : {0.0, 0.5})
+  {
+    mola::KeyframePointCloudMap m;
+    m.creationOptions.k_correspondences_for_cov = 5;
+    m.creationOptions.max_search_keyframes      = 1;
+    for (int k = 0; k < 2; ++k)
+    {
+      auto obs        = mrpt::obs::CObservationPointCloud::Create();
+      obs->pointcloud = makeCloudWithViews(toKeyframeFrame(map_pts, kfPose));
+      m.insertObservation(*obs, kfPose);  // identical -> one super-keyframe
+    }
+
+    mola::KeyframePointCloudMap::RegroupParams params;
+    params.merge_decimate_voxel = decimateVoxel;
+    auto g                      = m.regroupKeyframes(params);
+    ASSERT_(!g->isEmpty());
+
+    g->creationOptions.max_search_keyframes = 1;
+    g->icp_get_prepared_as_global(mrpt::poses::CPose3D::Identity());
+
+    ASSERT_(pairsUnderViewFilter(*g, Q, P, {0.f, +1.f, 0.f}));
+    ASSERT_(!pairsUnderViewFilter(*g, Q, P, {0.f, -1.f, 0.f}));
+  }
 }
 
 // ── 25. serialize_kdtrees round-trips the stream correctly ─────────────────
@@ -1561,6 +1666,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     std::cout << "test_view_filter_heading_sweep_pairing_accepted ...\n";
     test_view_filter_heading_sweep_pairing_accepted();
 
+    std::cout << "test_view_filter_reference_keyframe_heading_sweep ...\n";
+    test_view_filter_reference_keyframe_heading_sweep();
+
     std::cout << "test_kf_pose_plumbing ...\n";
     test_kf_pose_plumbing();
 
@@ -1581,6 +1689,9 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
 
     std::cout << "test_regroup_decimation_preserves_views ...\n";
     test_regroup_decimation_preserves_views();
+
+    std::cout << "test_regroup_rotated_anchor_preserves_views ...\n";
+    test_regroup_rotated_anchor_preserves_views();
 
     std::cout << "test_kdtree_serialization_roundtrip ...\n";
     test_kdtree_serialization_roundtrip();

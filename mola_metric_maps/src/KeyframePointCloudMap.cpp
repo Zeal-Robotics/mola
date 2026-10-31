@@ -1953,8 +1953,10 @@ mrpt::maps::CPointsMap::Ptr buildSuperKeyframeCloud(
 #else
   localCloud->insertAnotherMap(mergedGlobal.get(), anchorInv);
 #endif
-  // insertAnotherMap copies the (still global-frame) view vectors verbatim;
-  // rotate them into the anchor-local frame to satisfy the KF contract.
+#if MRPT_VERSION < 0x030600  // 3.6.0
+  // Before MRPT 3.6.0, insertAnotherMap() copies the (still global-frame) view
+  // vectors verbatim, so they must be rotated into the anchor-local frame here
+  // to satisfy the KF contract. From 3.6.0 it rotates them itself.
   if (hasView)
   {
 #if defined(MOLA_MM_HAS_ROTATE_VIEW_HEADER)
@@ -1963,6 +1965,7 @@ mrpt::maps::CPointsMap::Ptr buildSuperKeyframeCloud(
     rotateViewDirectionFieldsLegacy(*localCloud, anchorInv);
 #endif
   }
+#endif
 
   return localCloud;
 }
@@ -2863,12 +2866,14 @@ void KeyframePointCloudMap::KeyFrame::updatePointsGlobal() const
   // preserve existing fields but remove their data:
   pointcloud_global_->resize(0);
 
-  // XYZ coordinates are rotated+translated; custom fields are copied verbatim.
+  // XYZ coordinates are rotated+translated.
   // This automatically registers all source fields
   pointcloud_global_->insertAnotherMap(pointcloud_.get(), pose());
 
-  // insertAnotherMap() does not know that view_{x,y,z} are direction vectors,
-  // so it copies local-frame values as-is.  Rotate them to the global frame now.
+#if MRPT_VERSION < 0x030600  // 3.6.0
+  // Before MRPT 3.6.0, insertAnotherMap() copies view_{x,y,z} verbatim, so the
+  // local-frame values must be rotated to the global frame here. From 3.6.0 it
+  // rotates them itself.
   if (has_view)
   {
 #if defined(MOLA_MM_HAS_ROTATE_VIEW_HEADER)
@@ -2877,6 +2882,7 @@ void KeyframePointCloudMap::KeyFrame::updatePointsGlobal() const
     rotateViewDirectionFieldsLegacy(*pointcloud_global_, pose_);
 #endif
   }
+#endif
 }
 
 void KeyframePointCloudMap::KeyFrame::computeCovariancesAndDensity() const
