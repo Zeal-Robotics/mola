@@ -40,7 +40,10 @@
   <depend>tf2</depend>
   <depend>tf2_geometry_msgs</depend>
 
+  <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_lint_auto</test_depend>
+  <test_depend>tf2_msgs</test_depend>
+  <test_depend>tf2_ros</test_depend>
   <test_depend>ament_cmake_xmllint</test_depend>
   <test_depend>ament_lint_cmake</test_depend>
 

@@ -97,8 +97,21 @@ ament_export_dependencies()
 #ament_export_targets(export_${PROJECT_NAME})
 
 if(BUILD_TESTING)
-  #find_package(ament_cmake_gtest REQUIRED)
-  #ament_add_gtest(${PROJECT_NAME}-test test/test_xxx.cpp)
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(tf2_msgs REQUIRED)
+  find_package(tf2_ros REQUIRED)
+  ament_add_gtest(test_bridge_ros2 test/test_bridge_ros2.cpp TIMEOUT 120)
+  target_link_libraries(test_bridge_ros2
+    ${PROJECT_NAME}
+    mola::mola_kernel
+    mrpt_libros_bridge::mrpt_libros_bridge
+    tf2_ros::tf2_ros
+    ${tf2_msgs_TARGETS}
+  )
+  # The header's layout follows this, so the test must see what the library saw.
+  if(gps_msgs_FOUND)
+    target_compile_definitions(test_bridge_ros2 PRIVATE HAS_GPS_MSGS)
+  endif()
 
   find_package(ament_lint_auto REQUIRED)
 
