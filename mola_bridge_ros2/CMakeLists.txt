@@ -105,6 +105,7 @@ if(BUILD_TESTING)
     ${PROJECT_NAME}
     mola::mola_kernel
     mrpt_libros_bridge::mrpt_libros_bridge
+    mrpt::mrpt_maps
     tf2_ros::tf2_ros
     ${tf2_msgs_TARGETS}
   )
