@@ -17,15 +17,12 @@
 #include <mrpt/maps/CGenericPointsMap.h>
 #include <mrpt/math/CMatrixFixed.h>
 #include <mrpt/math/CQuaternion.h>
-#include <mrpt/math/ops_matrices.h>
 #include <mrpt/obs/CObservationIMU.h>
 #include <mrpt/obs/CObservationOdometry.h>
 #include <mrpt/obs/CObservationPointCloud.h>
 #include <mrpt/poses/CPose3D.h>
-#include <mrpt/poses/Lie/SO.h>
 #include <mrpt/ros2bridge/time.h>
 
-#include <Eigen/Dense>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -745,10 +742,9 @@ TEST_F(BridgeROS2Test, WheelOdometryReachesMolaAsPlanarOdometryWithVelocities)
 }
 
 // What the map EKF fuses: each localization on "<source>/pose" at the instant
-// and in the frames it was measured, its covariance over REP-103's
-// [x y z] and small rotation about the parent frame's fixed X, Y and Z axes
-// rather than MRPT's [x y z yaw pitch roll], and its quality on
-// "<source>/pose_quality", which scales the covariance floor.
+// and in the frames it was measured, its covariance in REP-103's
+// [x y z roll pitch yaw] rather than MRPT's [x y z yaw pitch roll], and its
+// quality on "<source>/pose_quality", which scales the covariance floor.
 TEST_F(BridgeROS2Test, LocalizationPoseAndQualityAreWhatTheEkfReads)
 {
   ASSERT_NO_FATAL_FAILURE(startBridge());
@@ -786,34 +782,13 @@ TEST_F(BridgeROS2Test, LocalizationPoseAndQualityAreWhatTheEkfReads)
           p.position.x, p.position.y, p.position.z),
       pose);
 
-  // The rotation part is first-order: J maps a change of MRPT's yaw, pitch
-  // and roll to the parent-frame rotation vector of R * R0^T, taken here by
-  // central differences. Away from yaw = 0 it mixes roll and pitch, so a plain
-  // reordering of MRPT's rows fails this.
-  const auto rotationVectorOf = [&](int k, double step)
-  {
-    double ypr[3] = {pose.yaw(), pose.pitch(), pose.roll()};
-    ypr[k] += step;
-    const auto moved = mrpt::poses::CPose3D::FromYawPitchRoll(ypr[0], ypr[1], ypr[2]);
-    const auto original =
-        mrpt::poses::CPose3D::FromYawPitchRoll(pose.yaw(), pose.pitch(), pose.roll());
-    return mrpt::poses::Lie::SO<3>::log((moved + -original).getRotationMatrix());
-  };
-  constexpr double            STEP = 1e-6;
-  mrpt::math::CMatrixDouble66 J;
-  J.setZero();
-  for (int i = 0; i < 3; i++) J(i, i) = 1.0;
-  for (int k = 0; k < 3; k++)
-  {
-    const auto d = (rotationVectorOf(k, STEP) - rotationVectorOf(k, -STEP)) * (0.5 / STEP);
-    for (int i = 0; i < 3; i++) J(3 + i, 3 + k) = d[i];
-  }
-  const auto expected = mrpt::math::multiply_HCHt(J, cov);
+  // REP-103 row r holds MRPT row MRPT_OF[r].
+  constexpr int MRPT_OF[6] = {0, 1, 2, 5, 4, 3};
   for (int r = 0; r < 6; r++)
   {
     for (int c = 0; c < 6; c++)
     {
-      EXPECT_NEAR(msg.pose.covariance[r * 6 + c], expected(r, c), 1e-9)
+      EXPECT_DOUBLE_EQ(msg.pose.covariance[r * 6 + c], cov(MRPT_OF[r], MRPT_OF[c]))
           << "covariance(" << r << ", " << c << ")";
     }
   }
